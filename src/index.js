@@ -196,23 +196,26 @@ async function addRepo(repo, watch, env, existingConfig) {
   const config = existingConfig || await getConfig(env);
   if (!config.watchRepos) config.watchRepos = [];
   const exists = config.watchRepos.find(r => (typeof r === "string" ? r : r.repo) === repo);
-  if (!exists) {
-    config.watchRepos.push({
-      repo,
-      watch: watch || { releases: true, commits: true, actions: false },
-    });
-    await env.WATCHER_STATE.put("config", JSON.stringify(config));
+  if (exists) {
+    return { success: true, added: false, repos: config.watchRepos.map(r => typeof r === "string" ? { repo: r, watch: { releases: true, commits: true, actions: false } } : r) };
   }
-  return { success: true, repos: config.watchRepos.map(r => typeof r === "string" ? { repo: r, watch: { releases: true, commits: true, actions: false } } : r) };
+  config.watchRepos.push({
+    repo,
+    watch: watch || { releases: true, commits: true, actions: false },
+  });
+  await env.WATCHER_STATE.put("config", JSON.stringify(config));
+  return { success: true, added: true, repos: config.watchRepos.map(r => typeof r === "string" ? { repo: r, watch: { releases: true, commits: true, actions: false } } : r) };
 }
 
 async function removeRepo(repo, env, existingConfig) {
   const config = existingConfig || await getConfig(env);
+  const before = (config.watchRepos || []).length;
   if (config.watchRepos) {
     config.watchRepos = config.watchRepos.filter((r) => (typeof r === "string" ? r : r.repo) !== repo);
     await env.WATCHER_STATE.put("config", JSON.stringify(config));
   }
-  return { success: true, repos: config.watchRepos };
+  const removed = (config.watchRepos || []).length < before;
+  return { success: true, removed, repos: config.watchRepos };
 }
 
 async function updateRepo(repo, watch, env, existingConfig) {
@@ -1509,9 +1512,13 @@ function getHTML() {
       };
       setBtnLoading('btn-add-repo', true);
       try {
-        await fetchAPI('/api/repos', { method: 'POST', body: JSON.stringify({ repo, watch }) });
+        const data = await fetchAPI('/api/repos', { method: 'POST', body: JSON.stringify({ repo, watch }) });
         input.value = '';
-        showToast('仓库已添加');
+        if (data.added === false) {
+          showToast('该仓库已在监控列表中');
+        } else {
+          showToast('仓库已添加');
+        }
         loadRepos();
         loadStatus();
       } catch (e) {
@@ -1524,8 +1531,12 @@ function getHTML() {
     async function removeRepo(repo) {
       if (!confirm('确定要移除 ' + repo + ' 吗？')) return;
       try {
-        await fetchAPI('/api/repos/' + encodeURIComponent(repo), { method: 'DELETE' });
-        showToast('仓库已移除');
+        const data = await fetchAPI('/api/repos/' + encodeURIComponent(repo), { method: 'DELETE' });
+        if (data.removed === false) {
+          showToast('未找到该仓库');
+        } else {
+          showToast('仓库已移除');
+        }
         loadRepos();
         loadStatus();
       } catch (e) {
