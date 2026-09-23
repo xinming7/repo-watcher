@@ -28,7 +28,7 @@ export default {
       const config = await getConfig(env);
       const isAuthRoute = path === "/api/auth" || path === "/api/auth/password";
       const isAPIRoute = path.startsWith("/api/");
-      if (isAPIRoute && !isAuthRoute && config.authPassword && !checkAuth(request, config)) {
+      if (isAPIRoute && !isAuthRoute && config.authPassword && !await checkAuth(request, config, env)) {
         return jsonResponse({ error: "Unauthorized" }, corsHeaders, 401);
       }
 
@@ -38,12 +38,20 @@ export default {
         let ok = false;
         if (!config.authPassword) {
           ok = true;
+        } else if (body.token) {
+          const stored = await env.WATCHER_STATE.get("session:" + body.token);
+          ok = stored === "valid";
         } else {
           try {
             const a = new TextEncoder().encode(body.password || "");
             const b = new TextEncoder().encode(config.authPassword);
             ok = a.length === b.length && crypto.subtle.timingSafeEqual(a, b);
           } catch { ok = false; }
+        }
+        if (ok && config.authPassword) {
+          const token = body.token || Array.from(crypto.getRandomValues(new Uint8Array(32))).map(b => b.toString(16).padStart(2,'0')).join('');
+          if (!body.token) await env.WATCHER_STATE.put("session:" + token, "valid", { expirationTtl: 604800 });
+          return jsonResponse({ authenticated: true, token }, corsHeaders);
         }
         return jsonResponse({ authenticated: ok }, corsHeaders, ok ? 200 : 401);
       }
@@ -271,14 +279,21 @@ function maskConfigTokens(config) {
   };
 }
 
-function checkAuth(request, config) {
+async function checkAuth(request, config, env) {
   if (!config.authPassword) return true;
   const auth = request.headers.get("Authorization");
   if (!auth) return false;
   const parts = auth.split(" ");
   if (parts.length !== 2 || parts[0] !== "Bearer") return false;
+  const token = parts[1];
+  // Try session token first (64-char hex)
+  if (token.length === 64 && /^[0-9a-f]+$/.test(token)) {
+    const stored = await env.WATCHER_STATE.get("session:" + token);
+    if (stored === "valid") return true;
+  }
+  // Fallback: compare as password
   try {
-    const a = new TextEncoder().encode(parts[1]);
+    const a = new TextEncoder().encode(token);
     const b = new TextEncoder().encode(config.authPassword);
     if (a.length !== b.length) return false;
     return crypto.subtle.timingSafeEqual(a, b);
@@ -1244,15 +1259,15 @@ function getHTML() {
     });
 
     const API = '';
-    let savedPassword = sessionStorage.getItem('grw_password') || '';
+    let authToken = sessionStorage.getItem('grw_token') || '';
 
     async function fetchAPI(path, options = {}) {
       const headers = { 'Content-Type': 'application/json', ...options.headers };
-      if (savedPassword) headers['Authorization'] = 'Bearer ' + savedPassword;
+      if (authToken) headers['Authorization'] = 'Bearer ' + authToken;
       const res = await fetch(API + path, { ...options, headers });
       if (res.status === 401) {
-        savedPassword = '';
-        sessionStorage.removeItem('grw_password');
+        authToken = '';
+        sessionStorage.removeItem('grw_token');
         showLogin();
         throw new Error('需要重新登录');
       }
@@ -1300,8 +1315,8 @@ function getHTML() {
         });
         const data = await r.json();
         if (data.authenticated) {
-          savedPassword = pw;
-          sessionStorage.setItem('grw_password', pw);
+          authToken = data.token || pw;
+          sessionStorage.setItem('grw_token', authToken);
           document.getElementById('login-error').style.display = 'none';
           showApp();
           initApp();
@@ -1392,6 +1407,7 @@ function getHTML() {
     }
 
     function escapeHTML(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+    function truncate(s, max) { return s.length > max ? s.slice(0, max - 1) + '\u2026' : s; }
 
     function formatTimeAgo(dateStr) {
       if (!dateStr) return '';
@@ -1672,7 +1688,7 @@ function getHTML() {
         const r = await fetch(API + '/api/auth', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ password: savedPassword }),
+          body: JSON.stringify(authToken ? { token: authToken } : { password: '' }),
         });
         const data = await r.json();
         if (data.authenticated) {
