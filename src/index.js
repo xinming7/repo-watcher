@@ -122,11 +122,12 @@ export default {
       }
       if (path === "/api/cron/trigger" && method === "POST") {
         const secret = env.CRON_SECRET;
-        if (secret) {
-          const authHeader = request.headers.get("Authorization");
-          if (!authHeader || authHeader !== "Bearer " + secret) {
-            return jsonResponse({ error: "Unauthorized" }, corsHeaders, 401);
-          }
+        if (!secret) {
+          return jsonResponse({ error: "CRON_SECRET not configured" }, corsHeaders, 503);
+        }
+        const authHeader = request.headers.get("Authorization");
+        if (!authHeader || authHeader !== "Bearer " + secret) {
+          return jsonResponse({ error: "Unauthorized" }, corsHeaders, 401);
         }
         const result = await checkAllRepos(env);
         return jsonResponse({ ok: true, ...result }, corsHeaders);
