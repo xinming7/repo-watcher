@@ -108,6 +108,9 @@ export default {
       if (path === "/api/github/starred" && method === "GET") {
         return jsonResponse(await getStarredRepos(config), corsHeaders);
       }
+      if (path === "/api/repos/activity" && method === "GET") {
+        return jsonResponse(await getReposActivity(config), corsHeaders);
+      }
 
       // Serve frontend
       return new Response(getHTML(), {
@@ -309,6 +312,50 @@ async function testTelegram(env, existingConfig) {
   }
 
   return { success: true, message: "Test message sent" };
+}
+
+async function getReposActivity(config) {
+  const repos = config.watchRepos || [];
+  if (repos.length === 0) return { activity: [] };
+  const results = await Promise.allSettled(
+    repos.map(async (entry) => {
+      const repoName = typeof entry === "string" ? entry : entry.repo;
+      const watch = typeof entry === "string" ? { releases: true, commits: true } : (entry.watch || {});
+      const result = { repo: repoName };
+      try {
+        if (watch.releases) {
+          const rel = await githubAPI(`/repos/${repoName}/releases?per_page=1`, config);
+          if (rel && Array.isArray(rel) && rel.length > 0) {
+            const r = rel[0];
+            result.latestRelease = {
+              tag: r.tag_name,
+              name: r.name || r.tag_name,
+              date: r.published_at,
+              url: r.html_url,
+              prerelease: r.prerelease,
+            };
+          }
+        }
+      } catch (e) { /* ignore */ }
+      try {
+        if (watch.commits) {
+          const commits = await githubAPI(`/repos/${repoName}/commits?per_page=1`, config);
+          if (commits && Array.isArray(commits) && commits.length > 0) {
+            const c = commits[0];
+            result.latestCommit = {
+              message: c.commit.message.split("\n")[0],
+              sha: c.sha.slice(0, 7),
+              date: c.commit.author?.date,
+              url: c.html_url,
+              author: c.commit.author?.name || "unknown",
+            };
+          }
+        }
+      } catch (e) { /* ignore */ }
+      return result;
+    })
+  );
+  return { activity: results.filter(r => r.status === "fulfilled").map(r => r.value) };
 }
 
 async function getStarredRepos(config) {
@@ -968,6 +1015,16 @@ function getHTML() {
     .starred-info .name { font-weight: 600; color: var(--accent); font-size: 14px; }
     .starred-info .desc { color: var(--text-muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
     .starred-info .meta { color: var(--text-dim); font-size: 11px; margin-top: 4px; display: flex; gap: 12px; }
+    .repo-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .repo-activity {
+      width: 100%; display: flex; flex-wrap: wrap; gap: 8px 16px;
+      padding-top: 8px; border-top: 1px solid var(--card-border-light); margin-top: 8px;
+    }
+    .repo-act-item {
+      font-size: 12px; color: var(--text-muted); display: flex; align-items: center; gap: 4px;
+    }
+    .repo-act-item a { color: var(--link-color); text-decoration: none; font-weight: 500; }
+    .repo-act-item a:hover { text-decoration: underline; }
     .starred-search { width: 100%; padding: 10px 14px; background: var(--input-bg); border: 1px solid var(--input-border); border-radius: 8px; color: var(--text-primary); font-size: 13px; margin-bottom: 12px; }
   </style>
 </head>
@@ -1336,8 +1393,26 @@ function getHTML() {
 
     function escapeHTML(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 
+    function formatTimeAgo(dateStr) {
+      if (!dateStr) return '';
+      const diff = Date.now() - new Date(dateStr).getTime();
+      const mins = Math.floor(diff / 60000);
+      if (mins < 1) return '刚刚';
+      if (mins < 60) return mins + ' 分钟前';
+      const hours = Math.floor(mins / 60);
+      if (hours < 24) return hours + ' 小时前';
+      const days = Math.floor(hours / 24);
+      if (days < 30) return days + ' 天前';
+      return new Date(dateStr).toLocaleDateString('zh-CN');
+    }
+
     async function loadRepos() {
-      const { repos } = await fetchAPI('/api/repos');
+      const [{ repos }, actData] = await Promise.all([
+        fetchAPI('/api/repos'),
+        fetchAPI('/api/repos/activity').catch(() => ({ activity: [] })),
+      ]);
+      const actMap = {};
+      (actData.activity || []).forEach(a => { actMap[a.repo] = a; });
       const list = document.getElementById('repo-list');
       if (repos.length === 0) {
         list.innerHTML = '<li class="empty-state">暂无监控仓库，请添加</li>';
@@ -1347,15 +1422,35 @@ function getHTML() {
         const repo = typeof r === 'string' ? r : r.repo;
         const w = (typeof r === 'string' ? {} : r.watch) || {};
         const safe = escapeHTML(repo);
+        const act = actMap[repo];
         const mkBtn = (key, label) => '<button class="toggle-btn ' + (w[key] ? 'on' : '') + '" data-repo="' + safe + '" data-watch="' + key + '">' + label + '</button>';
+        let activity = '';
+        if (act) {
+          const parts = [];
+          if (act.latestRelease) {
+            const r = act.latestRelease;
+            const pre = r.prerelease ? ' (Pre)' : '';
+            parts.push('<span class="repo-act-item" title="Latest Release">🏷️ <a href="' + escapeHTML(r.url) + '" target="_blank">' + escapeHTML(r.tag) + '</a>' + escapeHTML(pre) + ' · ' + formatTimeAgo(r.date) + '</span>');
+          }
+          if (act.latestCommit) {
+            const c = act.latestCommit;
+            parts.push('<span class="repo-act-item" title="Latest Commit">📝 <a href="' + escapeHTML(c.url) + '" target="_blank">' + escapeHTML(c.sha) + '</a> ' + escapeHTML(truncate(c.message, 40)) + ' · ' + formatTimeAgo(c.date) + '</span>');
+          }
+          if (parts.length > 0) {
+            activity = '<div class="repo-activity">' + parts.join('') + '</div>';
+          }
+        }
         return '<li class="repo-item">' +
-          '<span class="repo-name"><a href="https://github.com/' + safe + '" target="_blank">' + safe + '</a></span>' +
-          '<span class="repo-toggles">' +
-            mkBtn('releases', '🏷️ Release') +
-            mkBtn('commits', '📝 Commit') +
-            mkBtn('actions', '⚡ Actions') +
-          '</span>' +
-          '<button class="btn btn-danger btn-sm" data-remove="' + safe + '">删除</button>' +
+          '<div class="repo-row">' +
+            '<span class="repo-name"><a href="https://github.com/' + safe + '" target="_blank">' + safe + '</a></span>' +
+            '<span class="repo-toggles">' +
+              mkBtn('releases', '🏷️ Release') +
+              mkBtn('commits', '📝 Commit') +
+              mkBtn('actions', '⚡ Actions') +
+            '</span>' +
+            '<button class="btn btn-danger btn-sm" data-remove="' + safe + '">删除</button>' +
+          '</div>' +
+          activity +
         '</li>';
       }).join('');
     }
