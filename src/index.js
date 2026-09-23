@@ -1,0 +1,1590 @@
+// GitHub Repo Watcher - Cloudflare Worker with Dashboard
+
+export default {
+  // Cron trigger handler
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(checkAllRepos(env));
+  },
+
+  // HTTP handler
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const method = request.method;
+
+    // CORS headers
+    const corsHeaders = {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
+    };
+
+    if (method === "OPTIONS") {
+      return new Response(null, { headers: corsHeaders });
+    }
+
+    try {
+      // Auth check for all API routes (except auth itself and public pages)
+      const config = await getConfig(env);
+      const isAuthRoute = path === "/api/auth" || path === "/api/auth/password";
+      const isAPIRoute = path.startsWith("/api/");
+      if (isAPIRoute && !isAuthRoute && config.authPassword && !checkAuth(request, config)) {
+        return jsonResponse({ error: "Unauthorized" }, corsHeaders, 401);
+      }
+
+      // API Routes
+      if (path === "/api/auth" && method === "POST") {
+        const body = await request.json();
+        let ok = false;
+        if (!config.authPassword) {
+          ok = true;
+        } else {
+          try {
+            const a = new TextEncoder().encode(body.password || "");
+            const b = new TextEncoder().encode(config.authPassword);
+            ok = a.length === b.length && crypto.subtle.timingSafeEqual(a, b);
+          } catch { ok = false; }
+        }
+        return jsonResponse({ authenticated: ok }, corsHeaders, ok ? 200 : 401);
+      }
+      if (path === "/api/auth/password" && method === "POST") {
+        const body = await request.json();
+        // Require current password to change (unless setting for first time)
+        if (config.authPassword) {
+          if (!body.currentPassword) {
+            return jsonResponse({ error: "Current password required" }, corsHeaders, 403);
+          }
+          const a = new TextEncoder().encode(body.currentPassword);
+          const b = new TextEncoder().encode(config.authPassword);
+          if (a.length !== b.length || !crypto.subtle.timingSafeEqual(a, b)) {
+            return jsonResponse({ error: "Current password incorrect" }, corsHeaders, 403);
+          }
+        }
+        config.authPassword = body.password || "";
+        await env.WATCHER_STATE.put("config", JSON.stringify(config));
+        return jsonResponse({ success: true }, corsHeaders);
+      }
+      if (path === "/api/config" && method === "GET") {
+        return jsonResponse(maskConfigTokens(config), corsHeaders);
+      }
+      if (path === "/api/config" && method === "POST") {
+        const body = await request.json();
+        return jsonResponse(await saveConfig(body, env, config), corsHeaders);
+      }
+      if (path === "/api/repos" && method === "GET") {
+        return jsonResponse(await getRepos(env, config), corsHeaders);
+      }
+      if (path === "/api/repos" && method === "POST") {
+        const body = await request.json();
+        return jsonResponse(await addRepo(body.repo, body.watch, env, config), corsHeaders);
+      }
+      if (path.startsWith("/api/repos/") && method === "DELETE") {
+        const repo = decodeURIComponent(path.replace("/api/repos/", ""));
+        return jsonResponse(await removeRepo(repo, env, config), corsHeaders);
+      }
+      if (path.startsWith("/api/repos/") && method === "PUT") {
+        const repo = decodeURIComponent(path.replace("/api/repos/", ""));
+        const body = await request.json();
+        return jsonResponse(await updateRepo(repo, body.watch, env, config), corsHeaders);
+      }
+      if (path === "/api/history" && method === "GET") {
+        const limit = parseInt(url.searchParams.get("limit") || "50");
+        return jsonResponse(await getHistory(limit, env), corsHeaders);
+      }
+      if (path === "/api/history" && method === "DELETE") {
+        await env.WATCHER_STATE.put("history", JSON.stringify([]));
+        return jsonResponse({ success: true }, corsHeaders);
+      }
+      if (path === "/api/status" && method === "GET") {
+        return jsonResponse(await getStatus(env, config), corsHeaders);
+      }
+      if (path === "/api/check" && method === "POST") {
+        const result = await checkAllRepos(env);
+        return jsonResponse(result, corsHeaders);
+      }
+      if (path === "/api/test-telegram" && method === "POST") {
+        return jsonResponse(await testTelegram(env, config), corsHeaders);
+      }
+      if (path === "/api/github/starred" && method === "GET") {
+        return jsonResponse(await getStarredRepos(config), corsHeaders);
+      }
+
+      // Serve frontend
+      return new Response(getHTML(), {
+        headers: { "Content-Type": "text/html; charset=utf-8" },
+      });
+    } catch (err) {
+      return jsonResponse({ error: err.message }, corsHeaders, 500);
+    }
+  },
+};
+
+// ── Config API ──
+
+async function getConfig(env) {
+  const config = await env.WATCHER_STATE.get("config", { type: "json" });
+  if (!config) return { telegramBotToken: "", telegramChatId: "", watchRepos: [], authPassword: "" };
+  // Migrate old string format to object format
+  if (config.watchRepos && config.watchRepos.length > 0 && typeof config.watchRepos[0] === "string") {
+    config.watchRepos = config.watchRepos.map(r => ({
+      repo: r,
+      watch: { releases: true, commits: true, actions: false },
+    }));
+    await env.WATCHER_STATE.put("config", JSON.stringify(config));
+  }
+  return config;
+}
+
+async function saveConfig(body, env, existingConfig) {
+  const existing = existingConfig || await getConfig(env);
+  const config = {
+    telegramBotToken: body.telegramBotToken !== undefined ? body.telegramBotToken : existing.telegramBotToken,
+    telegramChatId: body.telegramChatId !== undefined ? body.telegramChatId : existing.telegramChatId,
+    githubToken: "githubToken" in body ? body.githubToken : existing.githubToken,
+    watchRepos: body.watchRepos !== undefined ? body.watchRepos : existing.watchRepos,
+    authPassword: body.authPassword !== undefined ? body.authPassword : existing.authPassword,
+    updatedAt: new Date().toISOString(),
+  };
+  await env.WATCHER_STATE.put("config", JSON.stringify(config));
+  // Return config with masked tokens
+  return { success: true, config: maskConfigTokens(config) };
+}
+
+// ── Repos API ──
+
+async function getRepos(env, existingConfig) {
+  const config = existingConfig || await getConfig(env);
+  const repos = (config.watchRepos || []).map(r => {
+    if (typeof r === "string") return { repo: r, watch: { releases: true, commits: true, actions: false } };
+    return r;
+  });
+  return { repos };
+}
+
+function parseRepoInput(input) {
+  const trimmed = input.trim();
+  // Support full URLs: https://github.com/owner/repo or github.com/owner/repo
+  const urlMatch = trimmed.match(/github\.com\/[\w.-]+\/[\w.-]+/);
+  if (urlMatch) {
+    const parts = urlMatch[0].split("/");
+    return parts[1] + "/" + parts[2];
+  }
+  // Support owner/repo format
+  if (trimmed.match(/^[\w.-]+\/[\w.-]+$/)) {
+    return trimmed;
+  }
+  return null;
+}
+
+async function addRepo(repo, watch, env, existingConfig) {
+  const parsed = parseRepoInput(repo);
+  if (!parsed) {
+    throw new Error("Invalid repo format. Use owner/repo or a GitHub URL");
+  }
+  repo = parsed;
+  const config = existingConfig || await getConfig(env);
+  if (!config.watchRepos) config.watchRepos = [];
+  const exists = config.watchRepos.find(r => (typeof r === "string" ? r : r.repo) === repo);
+  if (!exists) {
+    config.watchRepos.push({
+      repo,
+      watch: watch || { releases: true, commits: true, actions: false },
+    });
+    await env.WATCHER_STATE.put("config", JSON.stringify(config));
+  }
+  return { success: true, repos: config.watchRepos.map(r => typeof r === "string" ? { repo: r, watch: { releases: true, commits: true, actions: false } } : r) };
+}
+
+async function removeRepo(repo, env, existingConfig) {
+  const config = existingConfig || await getConfig(env);
+  if (config.watchRepos) {
+    config.watchRepos = config.watchRepos.filter((r) => (typeof r === "string" ? r : r.repo) !== repo);
+    await env.WATCHER_STATE.put("config", JSON.stringify(config));
+  }
+  return { success: true, repos: config.watchRepos };
+}
+
+async function updateRepo(repo, watch, env, existingConfig) {
+  const config = existingConfig || await getConfig(env);
+  if (config.watchRepos) {
+    const idx = config.watchRepos.findIndex((r) => (typeof r === "string" ? r : r.repo) === repo);
+    if (idx !== -1) {
+      const entry = config.watchRepos[idx];
+      const current = typeof entry === "string" ? { repo: entry, watch: { releases: true, commits: true, actions: false } } : entry;
+      current.watch = { ...current.watch, ...watch };
+      config.watchRepos[idx] = current;
+      await env.WATCHER_STATE.put("config", JSON.stringify(config));
+    }
+  }
+  return { success: true };
+}
+
+// ── History API ──
+
+async function getHistory(limit, env) {
+  const history = await env.WATCHER_STATE.get("history", { type: "json" });
+  return { history: (history || []).slice(0, limit) };
+}
+
+async function addHistoryEntry(entry, env) {
+  const history = (await env.WATCHER_STATE.get("history", { type: "json" })) || [];
+  history.unshift({
+    ...entry,
+    timestamp: new Date().toISOString(),
+  });
+  // Keep only last 200 entries
+  await env.WATCHER_STATE.put("history", JSON.stringify(history.slice(0, 200)));
+}
+
+// ── Status API ──
+
+async function getStatus(env, existingConfig) {
+  const config = existingConfig || await getConfig(env);
+  const history = (await env.WATCHER_STATE.get("history", { type: "json" })) || [];
+  const lastCheck = history.length > 0 ? history[0].timestamp : null;
+
+  return {
+    reposCount: (config.watchRepos || []).length,
+    notificationsSent: history.length,
+    lastCheck,
+    telegramConfigured: !!(config.telegramBotToken && config.telegramChatId),
+    cronSchedule: env.CRON_SCHEDULE || "*/30 * * * *",
+  };
+}
+
+// ── Auth helpers ──
+
+function maskConfigTokens(config) {
+  const mask = (s) => {
+    if (!s || s.length <= 8) return s ? "••••••••" : "";
+    return s.slice(0, 4) + "••••" + s.slice(-4);
+  };
+  return {
+    ...config,
+    telegramBotToken: mask(config.telegramBotToken),
+    githubToken: mask(config.githubToken),
+  };
+}
+
+function checkAuth(request, config) {
+  if (!config.authPassword) return true;
+  const auth = request.headers.get("Authorization");
+  if (!auth) return false;
+  const parts = auth.split(" ");
+  if (parts.length !== 2 || parts[0] !== "Bearer") return false;
+  try {
+    const a = new TextEncoder().encode(parts[1]);
+    const b = new TextEncoder().encode(config.authPassword);
+    if (a.length !== b.length) return false;
+    return crypto.subtle.timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
+
+// ── Test Telegram ──
+
+async function testTelegram(env, existingConfig) {
+  const config = existingConfig || await getConfig(env);
+  if (!config.telegramBotToken || !config.telegramChatId) {
+    throw new Error("Telegram not configured");
+  }
+
+  const url = `https://api.telegram.org/bot${config.telegramBotToken}/sendMessage`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: config.telegramChatId,
+      text: "✅ GitHub Repo Watcher 连接测试成功！",
+      parse_mode: "HTML",
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Telegram API error: ${err}`);
+  }
+
+  return { success: true, message: "Test message sent" };
+}
+
+async function getStarredRepos(config) {
+  if (!config.githubToken) {
+    throw new Error("GitHub Token not configured. Please set it in Telegram Settings.");
+  }
+  const data = await githubAPI("/user/starred?per_page=100&sort=updated", config);
+  if (!data || !Array.isArray(data)) return { starred: [] };
+  const existingRepos = (config.watchRepos || []).map(r => typeof r === "string" ? r : r.repo);
+  const starred = data.map(r => ({
+    repo: r.full_name,
+    description: r.description || "",
+    stars: r.stargazers_count,
+    language: r.language || "",
+    alreadyWatching: existingRepos.includes(r.full_name),
+  }));
+  return { starred };
+}
+
+// ── Main check logic ──
+
+async function checkAllRepos(env) {
+  const config = await getConfig(env);
+  const repos = config.watchRepos || [];
+
+  if (repos.length === 0) {
+    return { checked: 0, notifications: 0, message: "No repos configured" };
+  }
+
+  let notifications = 0;
+
+  for (const entry of repos) {
+    const repoName = typeof entry === "string" ? entry : entry.repo;
+    const watch = typeof entry === "string" ? { releases: true, commits: true, actions: false } : (entry.watch || {});
+    try {
+      const count = await checkRepo(repoName, watch, config, env);
+      notifications += count;
+    } catch (err) {
+      console.error(`Error checking ${repoName}:`, err.message);
+      await addHistoryEntry({ type: "error", repo: repoName, message: err.message }, env);
+    }
+  }
+
+  return { checked: repos.length, notifications };
+}
+
+async function checkRepo(repo, watch, config, env) {
+  let sent = 0;
+  if (watch.releases) sent += await checkReleases(repo, config, env);
+  if (watch.commits) sent += await checkCommits(repo, config, env);
+  if (watch.actions) sent += await checkActions(repo, config, env);
+  return sent;
+}
+
+async function checkReleases(repo, config, env) {
+  const data = await githubAPI(`/repos/${repo}/releases?per_page=5`, config);
+  if (!data || !Array.isArray(data) || data.length === 0) return 0;
+
+  const kvKey = `release:${repo}`;
+  const lastId = await env.WATCHER_STATE.get(kvKey);
+
+  // First run: always record state silently, never notify
+  if (!lastId) {
+    await env.WATCHER_STATE.put(kvKey, String(data[0].id));
+    return 0;
+  }
+
+  const lastIdNum = parseInt(lastId, 10);
+  const newReleases = data.filter((r) => r.id > lastIdNum);
+  if (newReleases.length === 0) return 0;
+
+  await env.WATCHER_STATE.put(kvKey, String(data[0].id));
+
+  for (const release of newReleases.reverse()) {
+    const tag = release.tag_name || "unknown";
+    const name = release.name || tag;
+    const url = release.html_url;
+    const isPre = release.prerelease ? " (Pre-release)" : "";
+    const date = new Date(release.published_at).toLocaleDateString("zh-CN");
+
+    const message =
+      `🏷️ <b>New Release</b>\n` +
+      `<b>${escapeHTML(repo)}</b>\n` +
+      `<b>${escapeHTML(name)}</b>${escapeHTML(isPre)}\n` +
+      `Tag: <code>${escapeHTML(tag)}</code>\n` +
+      `Date: ${date}\n` +
+      `<a href="${url}">View on GitHub →</a>`;
+
+    await sendTelegram(message, config);
+    await addHistoryEntry({ type: "release", repo, tag, name, url }, env);
+  }
+
+  return newReleases.length;
+}
+
+async function checkCommits(repo, config, env) {
+  const data = await githubAPI(`/repos/${repo}/commits?per_page=10`, config);
+  if (!data || !Array.isArray(data) || data.length === 0) return 0;
+
+  const kvKey = `commit:${repo}`;
+  const lastSha = await env.WATCHER_STATE.get(kvKey);
+
+  // First run: always record state silently, never notify
+  if (!lastSha) {
+    await env.WATCHER_STATE.put(kvKey, data[0].sha);
+    return 0;
+  }
+
+  let newCommits;
+  const idx = data.findIndex((c) => c.sha === lastSha);
+  newCommits = idx === -1 ? data.slice(0, 3) : data.slice(0, idx);
+  if (newCommits.length > 0) {
+    await env.WATCHER_STATE.put(kvKey, data[0].sha);
+  }
+
+  if (newCommits.length === 0) return 0;
+
+  if (newCommits.length === 1) {
+    const c = newCommits[0];
+    const msg = c.commit.message.split("\n")[0];
+    const author = c.commit.author?.name || "unknown";
+    const date = new Date(c.commit.author?.date).toLocaleString("zh-CN");
+    const shortSha = c.sha.slice(0, 7);
+
+    const message =
+      `📝 <b>New Commit</b>\n` +
+      `<b>${escapeHTML(repo)}</b>\n` +
+      `<code>${shortSha}</code> ${escapeHTML(msg)}\n` +
+      `By ${escapeHTML(author)} · ${date}\n` +
+      `<a href="${c.html_url}">View on GitHub →</a>`;
+
+    await sendTelegram(message, config);
+    await addHistoryEntry({ type: "commit", repo, sha: shortSha, message: msg, author }, env);
+  } else {
+    const lines = newCommits
+      .reverse()
+      .map((c) => {
+        const msg = c.commit.message.split("\n")[0];
+        const sha = c.sha.slice(0, 7);
+        return `• <code>${sha}</code> ${escapeHTML(truncate(msg, 60))}`;
+      })
+      .join("\n");
+
+    const compareUrl = `https://github.com/${repo}/compare/${newCommits[newCommits.length - 1].sha.slice(0, 7)}...${newCommits[0].sha.slice(0, 7)}`;
+
+    const message =
+      `📝 <b>${newCommits.length} New Commits</b>\n` +
+      `<b>${escapeHTML(repo)}</b>\n${lines}\n` +
+      `<a href="${compareUrl}">View changes →</a>`;
+
+    await sendTelegram(message, config);
+    await addHistoryEntry({ type: "commits", repo, count: newCommits.length }, env);
+  }
+
+  return newCommits.length;
+}
+
+async function checkActions(repo, config, env) {
+  const data = await githubAPI(`/repos/${repo}/actions/runs?per_page=5&status=completed`, config);
+  if (!data || !data.workflow_runs || data.workflow_runs.length === 0) return 0;
+
+  const kvKey = `action:${repo}`;
+  const lastId = await env.WATCHER_STATE.get(kvKey);
+
+  if (!lastId) {
+    await env.WATCHER_STATE.put(kvKey, String(data.workflow_runs[0].id));
+    return 0;
+  }
+
+  const lastIdNum = parseInt(lastId, 10);
+  const newRuns = data.workflow_runs.filter((r) => r.id > lastIdNum);
+  if (newRuns.length === 0) return 0;
+
+  await env.WATCHER_STATE.put(kvKey, String(data.workflow_runs[0].id));
+
+  for (const run of newRuns.reverse()) {
+    const name = run.name || "workflow";
+    const status = run.conclusion === "success" ? "✅" : run.conclusion === "failure" ? "❌" : "⚠️";
+    const branch = run.head_branch || "";
+    const date = new Date(run.updated_at).toLocaleString("zh-CN");
+
+    const message =
+      `${status} <b>Actions: ${escapeHTML(name)}</b>\n` +
+      `<b>${escapeHTML(repo)}</b>\n` +
+      `Branch: <code>${escapeHTML(branch)}</code>\n` +
+      `Result: ${escapeHTML(run.conclusion || "completed")}\n` +
+      `Date: ${date}\n` +
+      `<a href="${run.html_url}">View on GitHub →</a>`;
+
+    await sendTelegram(message, config);
+    await addHistoryEntry({ type: "action", repo, name, conclusion: run.conclusion, url: run.html_url }, env);
+  }
+
+  return newRuns.length;
+}
+
+// ── GitHub API helper ──
+
+async function githubAPI(path, config) {
+  const headers = {
+    Accept: "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+    "User-Agent": "github-repo-watcher",
+  };
+
+  if (config.githubToken) {
+    headers.Authorization = `Bearer ${config.githubToken}`;
+  }
+
+  const res = await fetch(`https://api.github.com${path}`, { headers });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`GitHub API ${res.status}: ${text}`);
+  }
+  return res.json();
+}
+
+// ── Telegram helper ──
+
+async function sendTelegram(text, config) {
+  if (!config.telegramBotToken || !config.telegramChatId) {
+    console.log("Telegram not configured, skipping notification");
+    return;
+  }
+
+  const url = `https://api.telegram.org/bot${config.telegramBotToken}/sendMessage`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: config.telegramChatId,
+      text,
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Telegram API ${res.status}: ${err}`);
+  }
+  return res.json();
+}
+
+// ── Utilities ──
+
+function escapeHTML(str) {
+  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function truncate(str, max) {
+  return str.length > max ? str.slice(0, max - 1) + "…" : str;
+}
+
+function jsonResponse(data, corsHeaders, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json", ...corsHeaders },
+  });
+}
+
+// ── HTML Frontend ──
+
+function getHTML() {
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GitHub Repo Watcher</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    :root {
+      --bg-gradient: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      --text-primary: #e0e0e0;
+      --text-secondary: #aaa;
+      --text-muted: #888;
+      --text-dim: #666;
+      --accent: #00d9ff;
+      --accent-green: #00ff88;
+      --accent-gradient: linear-gradient(90deg, #00d9ff, #00ff88);
+      --btn-primary-color: #000;
+      --link-color: #00d9ff;
+      --checkbox-accent: #00d9ff;
+      --label-color: #aaa;
+      --card-bg: rgba(255, 255, 255, 0.05);
+      --card-border: rgba(255, 255, 255, 0.1);
+      --card-border-light: rgba(255, 255, 255, 0.08);
+      --input-bg: rgba(255, 255, 255, 0.08);
+      --input-border: rgba(255, 255, 255, 0.15);
+      --input-focus-bg: rgba(0, 217, 255, 0.05);
+      --btn-secondary-bg: rgba(255, 255, 255, 0.1);
+      --btn-secondary-border: rgba(255, 255, 255, 0.2);
+      --btn-secondary-hover: rgba(255, 255, 255, 0.15);
+      --btn-danger-bg: rgba(255, 59, 48, 0.2);
+      --btn-danger-color: #ff3b30;
+      --btn-danger-border: rgba(255, 59, 48, 0.3);
+      --btn-danger-hover: rgba(255, 59, 48, 0.3);
+      --toggle-bg: rgba(255,255,255,0.05);
+      --toggle-border: rgba(255,255,255,0.15);
+      --toggle-on-bg: rgba(0,217,255,0.2);
+      --toggle-on-color: var(--accent);
+      --toggle-on-border: rgba(0,217,255,0.4);
+      --history-bg: rgba(255, 255, 255, 0.03);
+      --modal-overlay: rgba(0,0,0,0.6);
+      --modal-bg: #1a1a2e;
+      --starred-hover: rgba(255,255,255,0.06);
+      --starred-selected-bg: rgba(0,217,255,0.08);
+      --starred-selected-border: rgba(0,217,255,0.4);
+      --btn-primary-hover-shadow: rgba(0, 217, 255, 0.3);
+      --toast-success-bg: linear-gradient(90deg, #00ff88, #00d9ff);
+      --toast-success-color: #000;
+      --history-release: #00ff88;
+      --history-commit: #00d9ff;
+      --history-commits: #ff9500;
+      --history-action: #a855f7;
+      --history-error: #ff3b30;
+    }
+    [data-theme="light"] {
+      --bg-gradient: linear-gradient(135deg, #e8edf5 0%, #d5dde8 100%);
+      --text-primary: #1a1a2e;
+      --text-secondary: #555;
+      --text-muted: #666;
+      --text-dim: #999;
+      --accent: #0077cc;
+      --accent-green: #00aa55;
+      --accent-gradient: linear-gradient(90deg, #0077cc, #00aa55);
+      --btn-primary-color: #fff;
+      --link-color: #0077cc;
+      --checkbox-accent: #0077cc;
+      --label-color: #555;
+      --card-bg: rgba(255, 255, 255, 0.85);
+      --card-border: rgba(0, 0, 0, 0.1);
+      --card-border-light: rgba(0, 0, 0, 0.06);
+      --input-bg: rgba(0, 0, 0, 0.04);
+      --input-border: rgba(0, 0, 0, 0.12);
+      --input-focus-bg: rgba(0, 119, 204, 0.05);
+      --btn-secondary-bg: rgba(0, 0, 0, 0.06);
+      --btn-secondary-border: rgba(0, 0, 0, 0.15);
+      --btn-secondary-hover: rgba(0, 0, 0, 0.1);
+      --btn-danger-bg: rgba(255, 59, 48, 0.1);
+      --btn-danger-color: #d32f2f;
+      --btn-danger-border: rgba(255, 59, 48, 0.25);
+      --btn-danger-hover: rgba(255, 59, 48, 0.18);
+      --toggle-bg: rgba(0,0,0,0.04);
+      --toggle-border: rgba(0,0,0,0.12);
+      --toggle-on-bg: rgba(0,119,204,0.15);
+      --toggle-on-color: #0077cc;
+      --toggle-on-border: rgba(0,119,204,0.35);
+      --history-bg: rgba(0, 0, 0, 0.03);
+      --modal-overlay: rgba(0,0,0,0.3);
+      --modal-bg: #fff;
+      --starred-hover: rgba(0,0,0,0.04);
+      --starred-selected-bg: rgba(0,119,204,0.06);
+      --starred-selected-border: rgba(0,119,204,0.35);
+      --btn-primary-hover-shadow: rgba(0, 119, 204, 0.3);
+      --toast-success-bg: linear-gradient(90deg, #00aa55, #0077cc);
+      --toast-success-color: #fff;
+      --history-release: #00aa55;
+      --history-commit: #0077cc;
+      --history-commits: #e67e00;
+      --history-action: #7c3aed;
+      --history-error: #d32f2f;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg-gradient);
+      min-height: 100vh;
+      color: var(--text-primary);
+      padding: 20px;
+      transition: background 0.3s, color 0.3s;
+    }
+    .container {
+      max-width: 900px;
+      margin: 0 auto;
+    }
+    .header {
+      text-align: center;
+      padding: 40px 20px;
+      margin-bottom: 30px;
+    }
+    .header h1 {
+      font-size: 2.5em;
+      background: var(--accent-gradient);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin-bottom: 10px;
+    }
+    .header p {
+      color: var(--text-muted);
+      font-size: 1.1em;
+    }
+    .card {
+      background: var(--card-bg);
+      border-radius: 16px;
+      padding: 30px;
+      margin-bottom: 24px;
+      backdrop-filter: blur(10px);
+      border: 1px solid var(--card-border);
+    }
+    .card h2 {
+      font-size: 1.3em;
+      margin-bottom: 20px;
+      color: var(--accent);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .form-group {
+      margin-bottom: 20px;
+    }
+    label {
+      display: block;
+      margin-bottom: 8px;
+      font-weight: 500;
+      color: var(--text-secondary);
+    }
+    input, textarea {
+      width: 100%;
+      padding: 12px 16px;
+      background: var(--input-bg);
+      border: 1px solid var(--input-border);
+      border-radius: 10px;
+      color: var(--text-primary);
+      font-size: 14px;
+      transition: all 0.3s;
+    }
+    input:focus, textarea:focus {
+      outline: none;
+      border-color: var(--accent);
+      background: var(--input-focus-bg);
+    }
+    textarea { min-height: 100px; resize: vertical; }
+    .btn {
+      padding: 12px 24px;
+      border: none;
+      border-radius: 10px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.3s;
+    }
+    .btn-primary {
+      background: var(--accent-gradient);
+      color: var(--btn-primary-color);
+    }
+    .btn-primary:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 25px var(--btn-primary-hover-shadow);
+    }
+    .btn-secondary {
+      background: var(--btn-secondary-bg);
+      color: var(--text-primary);
+      border: 1px solid var(--btn-secondary-border);
+    }
+    .btn-secondary:hover {
+      background: var(--btn-secondary-hover);
+    }
+    .btn-danger {
+      background: var(--btn-danger-bg);
+      color: var(--btn-danger-color);
+      border: 1px solid var(--btn-danger-border);
+    }
+    .btn-danger:hover {
+      background: var(--btn-danger-hover);
+    }
+    .btn-group {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .repo-list {
+      list-style: none;
+    }
+    .repo-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 14px 18px;
+      background: var(--card-bg);
+      border-radius: 10px;
+      margin-bottom: 10px;
+      border: 1px solid var(--card-border-light);
+    }
+    .repo-item a {
+      color: var(--link-color);
+      text-decoration: none;
+      font-weight: 500;
+    }
+    .repo-item a:hover { text-decoration: underline; }
+    .add-repo {
+      display: flex;
+      gap: 12px;
+      margin-top: 20px;
+    }
+    .add-repo input { flex: 1; }
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 20px;
+    }
+    .stat-card {
+      background: var(--card-bg);
+      border-radius: 12px;
+      padding: 20px;
+      text-align: center;
+      border: 1px solid var(--card-border-light);
+    }
+    .stat-value {
+      font-size: 2em;
+      font-weight: 700;
+      background: var(--accent-gradient);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .stat-label {
+      color: var(--text-muted);
+      margin-top: 8px;
+      font-size: 0.9em;
+    }
+    .history-item {
+      padding: 16px 18px;
+      background: var(--history-bg);
+      border-radius: 10px;
+      margin-bottom: 10px;
+      border-left: 3px solid;
+      font-size: 14px;
+    }
+    .history-item.release { border-color: var(--history-release); }
+    .history-item.commit { border-color: var(--history-commit); }
+    .history-item.commits { border-color: var(--history-commits); }
+    .history-item.action { border-color: var(--history-action); }
+    .history-item.error { border-color: var(--history-error); }
+    .history-meta {
+      color: var(--text-dim);
+      font-size: 12px;
+      margin-top: 6px;
+    }
+    .toast {
+      position: fixed;
+      bottom: 30px;
+      right: 30px;
+      padding: 16px 24px;
+      border-radius: 12px;
+      color: #fff;
+      font-weight: 500;
+      transform: translateY(100px);
+      opacity: 0;
+      transition: all 0.3s;
+      z-index: 1000;
+    }
+    .toast.show { transform: translateY(0); opacity: 1; }
+    .toast.success { background: var(--toast-success-bg); color: var(--toast-success-color); }
+    .toast.error { background: #ff3b30; }
+    .loading { opacity: 0.5; pointer-events: none; }
+    .empty-state {
+      text-align: center;
+      padding: 40px;
+      color: var(--text-dim);
+    }
+    .btn-sm { padding: 8px 16px; font-size: 12px; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; pointer-events: none; }
+    .login-page { display: flex; justify-content: center; align-items: center; min-height: 80vh; }
+    .login-card { max-width: 400px; width: 100%; }
+    .login-card .btn { width: 100%; margin-top: 10px; }
+    
+    .token-hint { font-size: 12px; color: var(--text-dim); margin-top: 4px; }
+    .settings-row { display: flex; gap: 12px; margin-top: 15px; }
+    .settings-row .btn { flex: 1; }
+    .theme-switcher {
+      display: flex; justify-content: center; gap: 6px; margin-top: 16px;
+    }
+    .theme-btn {
+      width: 36px; height: 36px; border-radius: 10px; border: 1px solid var(--card-border);
+      background: var(--card-bg); font-size: 16px; cursor: pointer; transition: all 0.2s;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .theme-btn:hover { background: var(--btn-secondary-hover); }
+    .theme-btn.active { border-color: var(--accent); background: var(--toggle-on-bg); box-shadow: 0 0 8px rgba(0,217,255,0.2); }
+    @media (max-width: 600px) {
+      body { padding: 10px; }
+      .header h1 { font-size: 1.8em; }
+      .card { padding: 20px; }
+      .btn-group { flex-direction: column; }
+      .add-repo { flex-direction: column; }
+    }
+
+            details { margin-bottom: 24px; }
+    details > summary {
+      list-style: none;
+      cursor: pointer;
+      background: var(--card-bg);
+      border-radius: 16px;
+      padding: 20px 30px;
+      border: 1px solid var(--card-border);
+      backdrop-filter: blur(10px);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      transition: border-radius 0.3s;
+    }
+    details[open] > summary { border-radius: 16px 16px 0 0; }
+    details > summary:hover { background: var(--btn-secondary-hover); }
+    details > summary::-webkit-details-marker { display: none; }
+    details > summary::after {
+      content: '▸';
+      margin-left: auto;
+      transition: transform 0.3s;
+      color: var(--text-muted);
+      font-size: 1.2em;
+    }
+    details[open] > summary::after { transform: rotate(90deg); }
+    details > summary h2 { margin: 0; font-size: 1.3em; color: var(--accent); display: flex; align-items: center; gap: 10px; }
+    details > .card-inner {
+      background: var(--card-bg);
+      border-radius: 0 0 16px 16px;
+      border: 1px solid var(--card-border);
+      border-top: none;
+      margin-top: -1px;
+      padding: 30px;
+      overflow: hidden;
+    }
+    details > .card-inner.collapsing {
+      transition: max-height 0.3s ease, opacity 0.25s ease;
+      opacity: 0;
+    }
+    details > .card-inner.expanding {
+      transition: max-height 0.3s ease, opacity 0.25s ease;
+      opacity: 1;
+    }
+    .repo-item { flex-wrap: wrap; gap: 8px; }
+    .repo-name { flex: 1; min-width: 200px; }
+    .repo-toggles { display: flex; gap: 6px; align-items: center; }
+    .toggle-btn {
+      padding: 3px 8px; border-radius: 6px; font-size: 11px; font-weight: 600;
+      border: 1px solid var(--toggle-border); cursor: pointer; transition: all 0.2s;
+      background: var(--toggle-bg); color: var(--text-dim);
+    }
+    .toggle-btn.on { background: var(--toggle-on-bg); color: var(--toggle-on-color); border-color: var(--toggle-on-border); }
+    .toggle-btn:hover { background: var(--btn-secondary-hover); }
+    .add-repo-options { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; align-items: center; }
+    .add-repo-options label { display: flex; align-items: center; gap: 4px; font-size: 13px; color: var(--label-color); cursor: pointer; margin: 0; }
+    .add-repo-options input[type="checkbox"] { width: 14px; height: 14px; accent-color: var(--checkbox-accent); }
+    .starred-item {
+      display: flex; align-items: center; gap: 12px; padding: 12px 16px;
+      background: var(--card-bg); border-radius: 10px; margin-bottom: 8px;
+      border: 1px solid var(--card-border-light); cursor: pointer; transition: all 0.2s;
+    }
+    .starred-item:hover { background: var(--starred-hover); }
+    .starred-item.selected { border-color: var(--starred-selected-border); background: var(--starred-selected-bg); }
+    .starred-item.already { opacity: 0.4; pointer-events: none; }
+    .starred-item input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--checkbox-accent); flex-shrink: 0; }
+    .starred-info { flex: 1; min-width: 0; }
+    .starred-info .name { font-weight: 600; color: var(--accent); font-size: 14px; }
+    .starred-info .desc { color: var(--text-muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
+    .starred-info .meta { color: var(--text-dim); font-size: 11px; margin-top: 4px; display: flex; gap: 12px; }
+    .starred-search { width: 100%; padding: 10px 14px; background: var(--input-bg); border: 1px solid var(--input-border); border-radius: 8px; color: var(--text-primary); font-size: 13px; margin-bottom: 12px; }
+  </style>
+</head>
+<body>
+  <!-- Login Page -->
+  <div id="login-page" class="login-page" style="display:none">
+    <div class="login-card card">
+      <h2 style="justify-content:center">🔒 访问验证</h2>
+      <div class="form-group">
+        <label>密码</label>
+        <input type="password" id="login-password" placeholder="请输入访问密码" onkeydown="if(event.key==='Enter')doLogin()">
+      </div>
+      <button class="btn btn-primary" id="btn-login" onclick="doLogin()">进入</button>
+      <p id="login-error" style="color:#ff3b30;margin-top:10px;text-align:center;display:none">密码错误</p>
+    </div>
+  </div>
+
+  <!-- Main App -->
+  <div id="app" style="display:none">
+  <div class="container">
+    <div class="header">
+      <h1>GitHub Repo Watcher</h1>
+      <p>自动监控 GitHub 仓库更新，Telegram 实时通知</p>
+      <div class="theme-switcher">
+        <button class="theme-btn" data-theme="dark" onclick="setTheme('dark')" title="深色">🌙</button>
+        <button class="theme-btn" data-theme="auto" onclick="setTheme('auto')" title="自动">💻</button>
+        <button class="theme-btn" data-theme="light" onclick="setTheme('light')" title="浅色">☀️</button>
+      </div>
+    </div>
+
+    <!-- 1. Repos Management -->
+    <details open>
+      <summary><h2>📦 监控仓库</h2></summary>
+      <div class="card-inner">
+        <ul class="repo-list" id="repo-list">
+          <li class="empty-state">暂无监控仓库，请添加</li>
+        </ul>
+        <div class="add-repo">
+          <input type="text" id="new-repo" placeholder="输入仓库名，如 facebook/react">
+          <button class="btn btn-primary" id="btn-add-repo" onclick="addRepo()">➕ 添加</button>
+        </div>
+        <div class="add-repo-options">
+          <label><input type="checkbox" id="opt-releases" checked> 🏷️ Release</label>
+          <label><input type="checkbox" id="opt-commits"> 📝 Commit</label>
+          <label><input type="checkbox" id="opt-actions"> ⚡ Actions</label>
+          <button class="btn btn-secondary btn-sm" id="btn-import-stars" onclick="showStarredModal()" style="margin-left:auto">⭐ 从 Star 导入</button>
+        </div>
+      </div>
+    </details>
+
+    <!-- 2. Status Stats -->
+    <details>
+      <summary><h2>📊 运行状态</h2></summary>
+      <div class="card-inner">
+        <div class="stats-grid">
+          <div class="stat-card">
+            <div class="stat-value" id="stat-repos">-</div>
+            <div class="stat-label">监控仓库</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" id="stat-notifications">-</div>
+            <div class="stat-label">已发送通知</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" id="stat-telegram">-</div>
+            <div class="stat-label">Telegram 状态</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" id="stat-last-check">-</div>
+            <div class="stat-label">最后检查</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" id="stat-cron">-</div>
+            <div class="stat-label">检查频率</div>
+          </div>
+        </div>
+        <div class="btn-group" style="margin-top: 20px;">
+          <button class="btn btn-secondary" id="btn-check-now" onclick="checkNow()">🔄 立即检查</button>
+          <button class="btn btn-secondary" id="btn-test-tg" onclick="testTelegram()">💬 测试 Telegram</button>
+        </div>
+      </div>
+    </details>
+
+    <!-- 3. Telegram Settings -->
+    <details>
+      <summary><h2>🤖 Telegram 设置</h2></summary>
+      <div class="card-inner">
+        <div class="form-group">
+          <label>Bot Token</label>
+          <input type="password" id="telegram-token" placeholder="从 @BotFather 获取">
+        </div>
+        <div class="form-group">
+          <label>Chat ID</label>
+          <input type="text" id="telegram-chat-id" placeholder="私聊或群组的 Chat ID">
+        </div>
+        <div class="form-group">
+          <label>GitHub Token（可选）</label>
+          <input type="password" id="github-token" placeholder="提升 API 速率限制">
+          <div class="token-hint" id="github-token-hint"></div>
+        </div>
+        <button class="btn btn-primary" id="btn-save-config" onclick="saveConfig()">💾 保存设置</button>
+      </div>
+    </details>
+
+    <!-- 4. Access Password -->
+    <details>
+      <summary><h2>🔐 访问密码</h2></summary>
+      <div class="card-inner">
+        <div class="form-group">
+          <label>Dashboard 访问密码</label>
+          <input type="password" id="access-password" placeholder="留空则不需要密码">
+        </div>
+        <div class="settings-row">
+          <button class="btn btn-primary" id="btn-save-password" onclick="savePassword()">设置密码</button>
+          <button class="btn btn-danger" id="btn-clear-password" onclick="clearPassword()">取消密码</button>
+        </div>
+      </div>
+    </details>
+
+    <!-- 5. History -->
+    <details>
+      <summary>
+        <h2>📜 通知历史</h2>
+        <button class="btn btn-danger btn-sm" id="btn-clear-history" onclick="event.stopPropagation();clearHistory()" style="margin-left:auto">🗑️ 清空</button>
+      </summary>
+      <div class="card-inner">
+        <div id="history-list">
+          <div class="empty-state">暂无通知记录</div>
+        </div>
+      </div>
+    </details>
+  </div>
+  </div>
+
+  <!-- Starred Modal -->
+  <div id="starred-modal" style="display:none;position:fixed;inset:0;z-index:999;background:var(--modal-overlay);backdrop-filter:blur(4px);justify-content:center;align-items:center" onclick="if(event.target===this)closeStarredModal()">
+    <div style="background:var(--modal-bg);border:1px solid var(--card-border);border-radius:16px;width:90%;max-width:700px;max-height:80vh;display:flex;flex-direction:column">
+      <div style="padding:20px 24px;border-bottom:1px solid var(--card-border);display:flex;justify-content:space-between;align-items:center">
+        <h2 style="margin:0;color:var(--accent);font-size:1.2em">⭐ GitHub Starred Repos</h2>
+        <button class="btn btn-secondary btn-sm" onclick="closeStarredModal()">✕</button>
+      </div>
+      <div id="starred-list" style="padding:16px 24px;overflow-y:auto;flex:1">
+        <div class="empty-state">加载中...</div>
+      </div>
+      <div style="padding:16px 24px;border-top:1px solid var(--card-border);display:flex;justify-content:space-between;align-items:center">
+        <span id="starred-count" style="color:var(--text-muted);font-size:13px">已选 0 个</span>
+        <button class="btn btn-primary" id="btn-add-starred" onclick="addStarredRepos()">➕ 添加选中</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div class="toast" id="toast"></div>
+
+    <script>
+    // Theme
+    function setTheme(mode) {
+      localStorage.setItem('grw_theme', mode);
+      applyTheme(mode);
+    }
+    function applyTheme(mode) {
+      const root = document.documentElement;
+      if (mode === 'light') {
+        root.setAttribute('data-theme', 'light');
+      } else if (mode === 'dark') {
+        root.removeAttribute('data-theme');
+      } else {
+        // auto: follow system
+        if (window.matchMedia('(prefers-color-scheme: light)').matches) {
+          root.setAttribute('data-theme', 'light');
+        } else {
+          root.removeAttribute('data-theme');
+        }
+      }
+      document.querySelectorAll('.theme-btn').forEach(b => b.classList.toggle('active', b.dataset.theme === mode));
+    }
+    // Apply saved theme immediately
+    applyTheme(localStorage.getItem('grw_theme') || 'auto');
+    // Listen for system theme changes in auto mode
+    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+      if (!localStorage.getItem('grw_theme') || localStorage.getItem('grw_theme') === 'auto') applyTheme('auto');
+    });
+
+    // Collapsible animation
+    document.querySelectorAll('details').forEach(detail => {
+      const inner = detail.querySelector('.card-inner');
+      if (!inner) return;
+      if (!detail.open) {
+        inner.style.maxHeight = '0';
+        inner.style.opacity = '0';
+      }
+      detail.addEventListener('click', e => {
+        if (e.target.closest('button')) return;
+        e.preventDefault();
+        if (detail.open) {
+          inner.style.overflow = 'hidden';
+          inner.style.maxHeight = inner.scrollHeight + 'px';
+          inner.style.transition = 'max-height 0.3s ease, opacity 0.25s ease';
+          requestAnimationFrame(() => {
+            inner.style.maxHeight = '0';
+            inner.style.opacity = '0';
+          });
+          setTimeout(() => { detail.removeAttribute('open'); inner.style.transition = ''; }, 300);
+        } else {
+          detail.setAttribute('open', '');
+          inner.style.overflow = 'hidden';
+          inner.style.maxHeight = '0';
+          inner.style.opacity = '0';
+          requestAnimationFrame(() => {
+            inner.style.transition = 'max-height 0.3s ease, opacity 0.25s ease';
+            inner.style.maxHeight = inner.scrollHeight + 'px';
+            inner.style.opacity = '1';
+            setTimeout(() => { inner.style.maxHeight = ''; inner.style.overflow = ''; inner.style.transition = ''; }, 300);
+          });
+        }
+      });
+    });
+
+    const API = '';
+    let savedPassword = sessionStorage.getItem('grw_password') || '';
+
+    async function fetchAPI(path, options = {}) {
+      const headers = { 'Content-Type': 'application/json', ...options.headers };
+      if (savedPassword) headers['Authorization'] = 'Bearer ' + savedPassword;
+      const res = await fetch(API + path, { ...options, headers });
+      if (res.status === 401) {
+        savedPassword = '';
+        sessionStorage.removeItem('grw_password');
+        showLogin();
+        throw new Error('需要重新登录');
+      }
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || 'Request failed');
+      }
+      return res.json();
+    }
+
+    let _toastTimer = null;
+    function showToast(msg, type = 'success') {
+      const toast = document.getElementById('toast');
+      if (_toastTimer) clearTimeout(_toastTimer);
+      toast.textContent = msg;
+      toast.className = 'toast ' + type;
+      _toastTimer = setTimeout(() => { toast.className = 'toast'; _toastTimer = null; }, 3000);
+    }
+
+    function setBtnLoading(id, loading) {
+      const btn = document.getElementById(id);
+      if (!btn) return;
+      btn.disabled = loading;
+      if (loading) btn.dataset.origText = btn.textContent;
+      else if (btn.dataset.origText) btn.textContent = btn.dataset.origText;
+    }
+
+    function showLogin() {
+      document.getElementById('login-page').style.display = 'flex';
+      document.getElementById('app').style.display = 'none';
+    }
+
+    function showApp() {
+      document.getElementById('login-page').style.display = 'none';
+      document.getElementById('app').style.display = 'block';
+    }
+
+    async function doLogin() {
+      const pw = document.getElementById('login-password').value;
+      try {
+        const r = await fetch(API + '/api/auth', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: pw }),
+        });
+        const data = await r.json();
+        if (data.authenticated) {
+          savedPassword = pw;
+          sessionStorage.setItem('grw_password', pw);
+          document.getElementById('login-error').style.display = 'none';
+          showApp();
+          initApp();
+        } else {
+          document.getElementById('login-error').style.display = 'block';
+        }
+      } catch (e) {
+        document.getElementById('login-error').style.display = 'block';
+      }
+    }
+
+    async function loadStatus() {
+      const status = await fetchAPI('/api/status');
+      document.getElementById('stat-repos').textContent = status.reposCount;
+      document.getElementById('stat-notifications').textContent = status.notificationsSent;
+      document.getElementById('stat-telegram').textContent = status.telegramConfigured ? '✅ 已配置' : '❌ 未配置';
+      document.getElementById('stat-last-check').textContent = status.lastCheck
+        ? new Date(status.lastCheck).toLocaleString('zh-CN')
+        : '从未';
+      document.getElementById('stat-cron').textContent = status.cronSchedule || '*/30 * * * *';
+    }
+
+    async function loadConfig() {
+      const config = await fetchAPI('/api/config');
+      const tokenInput = document.getElementById('telegram-token');
+      const ghInput = document.getElementById('github-token');
+      tokenInput.value = '';
+      tokenInput.placeholder = config.telegramBotToken ? config.telegramBotToken : '从 @BotFather 获取';
+      document.getElementById('telegram-chat-id').value = config.telegramChatId || '';
+      ghInput.value = '';
+      ghInput.placeholder = config.githubToken ? config.githubToken : '提升 API 速率限制';
+      ghInput.dataset.hasValue = config.githubToken ? '1' : '0';
+    }
+
+    async function saveConfig() {
+      setBtnLoading('btn-save-config', true);
+      try {
+        const tokenVal = document.getElementById('telegram-token').value.trim();
+        const ghVal = document.getElementById('github-token').value.trim();
+        const body = {
+          telegramBotToken: tokenVal || undefined,
+          telegramChatId: document.getElementById('telegram-chat-id').value.trim(),
+          githubToken: ghVal,
+        };
+        await fetchAPI('/api/config', { method: 'POST', body: JSON.stringify(body) });
+        showToast('设置已保存');
+        loadConfig();
+        loadStatus();
+      } catch (e) {
+        showToast('保存失败: ' + e.message, 'error');
+      } finally {
+        setBtnLoading('btn-save-config', false);
+      }
+    }
+
+    async function savePassword() {
+      const pw = document.getElementById('access-password').value;
+      if (!pw) { showToast('请输入新密码', 'error'); return; }
+      const currentPw = prompt('请输入当前密码（首次设置请留空）：') || '';
+      setBtnLoading('btn-save-password', true);
+      try {
+        const body = { password: pw };
+        if (currentPw) body.currentPassword = currentPw;
+        await fetchAPI('/api/auth/password', { method: 'POST', body: JSON.stringify(body) });
+        showToast('密码已设置');
+        document.getElementById('access-password').value = '';
+      } catch (e) {
+        showToast('设置失败: ' + e.message, 'error');
+      } finally {
+        setBtnLoading('btn-save-password', false);
+      }
+    }
+
+    async function clearPassword() {
+      if (!confirm('确定要取消访问密码吗？')) return;
+      setBtnLoading('btn-clear-password', true);
+      try {
+        await fetchAPI('/api/auth/password', { method: 'POST', body: JSON.stringify({ password: '' }) });
+        showToast('密码已取消');
+      } catch (e) {
+        showToast('操作失败: ' + e.message, 'error');
+      } finally {
+        setBtnLoading('btn-clear-password', false);
+      }
+    }
+
+    function escapeHTML(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+
+    async function loadRepos() {
+      const { repos } = await fetchAPI('/api/repos');
+      const list = document.getElementById('repo-list');
+      if (repos.length === 0) {
+        list.innerHTML = '<li class="empty-state">暂无监控仓库，请添加</li>';
+        return;
+      }
+      list.innerHTML = repos.map(r => {
+        const repo = typeof r === 'string' ? r : r.repo;
+        const w = (typeof r === 'string' ? {} : r.watch) || {};
+        const safe = escapeHTML(repo);
+        const mkBtn = (key, label) => '<button class="toggle-btn ' + (w[key] ? 'on' : '') + '" data-repo="' + safe + '" data-watch="' + key + '">' + label + '</button>';
+        return '<li class="repo-item">' +
+          '<span class="repo-name"><a href="https://github.com/' + safe + '" target="_blank">' + safe + '</a></span>' +
+          '<span class="repo-toggles">' +
+            mkBtn('releases', '🏷️ Release') +
+            mkBtn('commits', '📝 Commit') +
+            mkBtn('actions', '⚡ Actions') +
+          '</span>' +
+          '<button class="btn btn-danger btn-sm" data-remove="' + safe + '">删除</button>' +
+        '</li>';
+      }).join('');
+    }
+
+    document.addEventListener('click', e => {
+      const rmBtn = e.target.closest('[data-remove]');
+      if (rmBtn) return removeRepo(rmBtn.dataset.remove);
+      const tglBtn = e.target.closest('.toggle-btn[data-repo]');
+      if (tglBtn) return toggleRepoWatch(tglBtn.dataset.repo, tglBtn.dataset.watch, tglBtn);
+    });
+
+    async function toggleRepoWatch(repo, key, btn) {
+      const isOn = btn.classList.contains('on');
+      const patch = {}; patch[key] = !isOn;
+      try {
+        await fetchAPI('/api/repos/' + encodeURIComponent(repo), { method: 'PUT', body: JSON.stringify({ watch: patch }) });
+        btn.classList.toggle('on');
+      } catch (e) { showToast('更新失败: ' + e.message, 'error'); }
+    }
+
+    async function addRepo() {
+      const input = document.getElementById('new-repo');
+      const repo = input.value.trim();
+      if (!repo || !repo.includes('/')) {
+        showToast('请输入正确的仓库格式，如 owner/repo', 'error');
+        return;
+      }
+      const watch = {
+        releases: document.getElementById('opt-releases').checked,
+        commits: document.getElementById('opt-commits').checked,
+        actions: document.getElementById('opt-actions').checked,
+      };
+      setBtnLoading('btn-add-repo', true);
+      try {
+        await fetchAPI('/api/repos', { method: 'POST', body: JSON.stringify({ repo, watch }) });
+        input.value = '';
+        showToast('仓库已添加');
+        loadRepos();
+        loadStatus();
+      } catch (e) {
+        showToast('添加失败: ' + e.message, 'error');
+      } finally {
+        setBtnLoading('btn-add-repo', false);
+      }
+    }
+
+    async function removeRepo(repo) {
+      if (!confirm('确定要移除 ' + repo + ' 吗？')) return;
+      await fetchAPI('/api/repos/' + encodeURIComponent(repo), { method: 'DELETE' });
+      showToast('仓库已移除');
+      loadRepos();
+      loadStatus();
+    }
+
+            async function loadHistory() {
+      const { history } = await fetchAPI('/api/history?limit=30');
+      const list = document.getElementById('history-list');
+      if (history.length === 0) {
+        list.innerHTML = '<div class="empty-state">暂无通知记录</div>';
+        return;
+      }
+      list.innerHTML = history.map(h => {
+        const repo = escapeHTML(h.repo || '');
+        const name = escapeHTML(h.name || h.tag || '');
+        const sha = escapeHTML(h.sha || '');
+        const msg = escapeHTML(h.message || '');
+        const err = escapeHTML(h.message || '');
+        let content = '';
+        if (h.type === 'release') {
+          content = '🏷️ <b>新版本发布</b> ' + repo + ' - ' + name;
+        } else if (h.type === 'commit') {
+          content = '📝 <b>新提交</b> ' + repo + ' - <code>' + sha + '</code> ' + msg;
+        } else if (h.type === 'commits') {
+          content = '📝 <b>' + escapeHTML(String(h.count)) + ' 个新提交</b> ' + repo;
+        } else if (h.type === 'action') {
+          const concl = h.conclusion === 'success' ? '✅' : h.conclusion === 'failure' ? '❌' : '⚠️';
+          content = concl + ' <b>Actions</b> ' + repo + ' - ' + escapeHTML(h.name || '');
+        } else if (h.type === 'error') {
+          content = '❌ <b>错误</b> ' + repo + ': ' + err;
+        }
+        return '<div class="history-item ' + h.type + '">' + content +
+               '<div class="history-meta">' + new Date(h.timestamp).toLocaleString('zh-CN') + '</div></div>';
+      }).join('');
+    }
+
+    async function clearHistory() {
+      if (!confirm('确定要清空所有通知历史吗？')) return;
+      setBtnLoading('btn-clear-history', true);
+      try {
+        await fetchAPI('/api/history', { method: 'DELETE' });
+        showToast('历史已清空');
+        loadHistory();
+      } catch (e) {
+        showToast('清空失败: ' + e.message, 'error');
+      } finally {
+        setBtnLoading('btn-clear-history', false);
+      }
+    }
+
+    async function checkNow() {
+      setBtnLoading('btn-check-now', true);
+      try {
+        const result = await fetchAPI('/api/check', { method: 'POST' });
+        showToast('检查完成：' + result.notifications + ' 条新通知');
+        loadHistory();
+        loadStatus();
+      } catch (e) {
+        showToast('检查失败: ' + e.message, 'error');
+      } finally {
+        setBtnLoading('btn-check-now', false);
+      }
+    }
+
+    async function testTelegram() {
+      setBtnLoading('btn-test-tg', true);
+      try {
+        await fetchAPI('/api/test-telegram', { method: 'POST' });
+        showToast('测试消息已发送，请查看 Telegram');
+      } catch (e) {
+        showToast('测试失败: ' + e.message, 'error');
+      } finally {
+        setBtnLoading('btn-test-tg', false);
+      }
+    }
+
+    // Enter key support
+    document.getElementById('new-repo').addEventListener('keypress', e => {
+      if (e.key === 'Enter') addRepo();
+    });
+
+    // Starred repos modal
+    async function showStarredModal() {
+      const modal = document.getElementById('starred-modal');
+      modal.style.display = 'flex';
+      const list = document.getElementById('starred-list');
+      list.innerHTML = '<div class="empty-state">加载中...</div>';
+      try {
+        const data = await fetchAPI('/api/github/starred');
+        if (data.starred.length === 0) {
+          list.innerHTML = '<div class="empty-state">未找到 Starred 仓库（需要配置 GitHub Token）</div>';
+          return;
+        }
+        window._starredData = data.starred;
+        renderStarredList('');
+      } catch (e) {
+        list.innerHTML = '<div class="empty-state">加载失败: ' + escapeHTML(e.message) + '</div>';
+      }
+    }
+
+    function renderStarredList(filter) {
+      const data = (window._starredData || []).filter(r => !filter || r.repo.toLowerCase().includes(filter.toLowerCase()) || (r.description || '').toLowerCase().includes(filter.toLowerCase()));
+      const list = document.getElementById('starred-list');
+      list.innerHTML = '<input class="starred-search" placeholder="搜索仓库..." oninput="renderStarredList(this.value)">' +
+        data.map(r => {
+          const checked = r.alreadyWatching ? 'checked disabled' : '';
+          const cls = r.alreadyWatching ? 'starred-item already' : 'starred-item';
+          return '<div class="' + cls + '" data-repo="' + escapeHTML(r.repo) + '">' +
+            '<input type="checkbox" ' + checked + ' onchange="updateStarredCount()">' +
+            '<div class="starred-info">' +
+              '<div class="name">' + escapeHTML(r.repo) + (r.alreadyWatching ? ' ✅ 已添加' : '') + '</div>' +
+              (r.description ? '<div class="desc">' + escapeHTML(r.description) + '</div>' : '') +
+              '<div class="meta"><span>⭐ ' + r.stars + '</span>' + (r.language ? '<span>🔤 ' + escapeHTML(r.language) + '</span>' : '') + '</div>' +
+            '</div>' +
+          '</div>';
+        }).join('');
+      updateStarredCount();
+    }
+
+    function updateStarredCount() {
+      const count = document.querySelectorAll('#starred-list .starred-item input:checked').length;
+      document.getElementById('starred-count').textContent = '已选 ' + count + ' 个';
+    }
+
+    document.addEventListener('click', e => {
+      const item = e.target.closest('.starred-item:not(.already)');
+      if (item && !e.target.matches('input')) {
+        const cb = item.querySelector('input[type="checkbox"]');
+        cb.checked = !cb.checked;
+        item.classList.toggle('selected', cb.checked);
+        updateStarredCount();
+      }
+    });
+
+    function closeStarredModal() {
+      document.getElementById('starred-modal').style.display = 'none';
+    }
+
+    async function addStarredRepos() {
+      const checked = document.querySelectorAll('#starred-list .starred-item input:checked');
+      if (checked.length === 0) { showToast('请先选择仓库', 'error'); return; }
+      const watch = {
+        releases: document.getElementById('opt-releases').checked,
+        commits: document.getElementById('opt-commits').checked,
+        actions: document.getElementById('opt-actions').checked,
+      };
+      setBtnLoading('btn-add-starred', true);
+      let added = 0;
+      for (const cb of checked) {
+        const repo = cb.closest('.starred-item').dataset.repo;
+        try {
+          await fetchAPI('/api/repos', { method: 'POST', body: JSON.stringify({ repo, watch }) });
+          added++;
+        } catch (e) { /* skip */ }
+      }
+      setBtnLoading('btn-add-starred', false);
+      closeStarredModal();
+      showToast('已添加 ' + added + ' 个仓库');
+      loadRepos();
+      loadStatus();
+    }
+
+    // Init
+    async function initApp() {
+      await Promise.all([loadStatus(), loadConfig(), loadRepos(), loadHistory()]);
+    }
+
+    (async function init() {
+      // Check if password is required
+      try {
+        const r = await fetch(API + '/api/auth', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: savedPassword }),
+        });
+        const data = await r.json();
+        if (data.authenticated) {
+          showApp();
+          initApp();
+        } else {
+          showLogin();
+        }
+      } catch (e) {
+        showApp();
+        initApp();
+      }
+    })();
+  </script>
+</body>
+</html>`;
+}
