@@ -9,9 +9,8 @@ binding = "WATCHER_STATE"
 id = "c166e000694c4838a79b07fca53d61e2"
 
 # ── Cron Triggers ──
-# "*/30 * * * *" = every 30 minutes (adjust as needed)
-[triggers]
-crons = ["*/30 * * * *"]
+# Now handled by GitHub Actions (see .github/workflows/check.yml)
+# CRON_SECRET is set via `wrangler secret put CRON_SECRET` for auth
 
 # Note: All sensitive config (tokens, chat ID, repo list) is now stored in KV
 # via the web dashboard. No need for wrangler secrets for runtime config.

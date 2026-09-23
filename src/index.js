@@ -27,8 +27,9 @@ export default {
       // Auth check for all API routes (except auth itself and public pages)
       const config = await getConfig(env);
       const isAuthRoute = path === "/api/auth" || path === "/api/auth/password";
+      const isCronRoute = path === "/api/cron/trigger";
       const isAPIRoute = path.startsWith("/api/");
-      if (isAPIRoute && !isAuthRoute && config.authPassword && !await checkAuth(request, config, env)) {
+      if (isAPIRoute && !isAuthRoute && !isCronRoute && config.authPassword && !await checkAuth(request, config, env)) {
         return jsonResponse({ error: "Unauthorized" }, corsHeaders, 401);
       }
 
@@ -118,6 +119,17 @@ export default {
       }
       if (path === "/api/repos/activity" && method === "GET") {
         return jsonResponse(await getReposActivity(config, env), corsHeaders);
+      }
+      if (path === "/api/cron/trigger" && method === "POST") {
+        const secret = env.CRON_SECRET;
+        if (secret) {
+          const authHeader = request.headers.get("Authorization");
+          if (!authHeader || authHeader !== "Bearer " + secret) {
+            return jsonResponse({ error: "Unauthorized" }, corsHeaders, 401);
+          }
+        }
+        const result = await checkAllRepos(env);
+        return jsonResponse({ ok: true, ...result }, corsHeaders);
       }
 
       // Serve frontend

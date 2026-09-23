@@ -1,0 +1,17 @@
+name: Check Repos
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'  # 每30分钟
+  workflow_dispatch:  # 支持手动触发
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger repo check
+        run: |
+          curl -sf -X POST \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            -H "Content-Type: application/json" \
+            "https://github-repo-watcher.xinming.dpdns.org/api/cron/trigger" || exit 1
