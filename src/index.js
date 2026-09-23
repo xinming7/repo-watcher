@@ -794,6 +794,8 @@ function getHTML() {
       border-radius: 10px;
       margin-bottom: 10px;
       border: 1px solid var(--card-border-light);
+      flex-wrap: wrap;
+      gap: 8px;
     }
     .repo-item a {
       color: var(--link-color);
@@ -898,7 +900,7 @@ function getHTML() {
       .add-repo { flex-direction: column; }
     }
 
-            details { margin-bottom: 24px; }
+    details { margin-bottom: 24px; }
     details > summary {
       list-style: none;
       cursor: pointer;
@@ -941,7 +943,6 @@ function getHTML() {
       transition: max-height 0.3s ease, opacity 0.25s ease;
       opacity: 1;
     }
-    .repo-item { flex-wrap: wrap; gap: 8px; }
     .repo-name { flex: 1; min-width: 200px; }
     .repo-toggles { display: flex; gap: 6px; align-items: center; }
     .toggle-btn {
@@ -1121,7 +1122,7 @@ function getHTML() {
   <!-- Toast -->
   <div class="toast" id="toast"></div>
 
-    <script>
+  <script>
     // Theme
     function setTheme(mode) {
       localStorage.setItem('grw_theme', mode);
@@ -1409,7 +1410,7 @@ function getHTML() {
       loadStatus();
     }
 
-            async function loadHistory() {
+    async function loadHistory() {
       const { history } = await fetchAPI('/api/history?limit=30');
       const list = document.getElementById('history-list');
       if (history.length === 0) {
