@@ -117,7 +117,7 @@ export default {
         return jsonResponse(await getStarredRepos(config), corsHeaders);
       }
       if (path === "/api/repos/activity" && method === "GET") {
-        return jsonResponse(await getReposActivity(config), corsHeaders);
+        return jsonResponse(await getReposActivity(config, env), corsHeaders);
       }
 
       // Serve frontend
@@ -329,7 +329,12 @@ async function testTelegram(env, existingConfig) {
   return { success: true, message: "Test message sent" };
 }
 
-async function getReposActivity(config) {
+async function getReposActivity(config, env) {
+  // Check KV cache (5 min TTL)
+  const cached = await env.WATCHER_STATE.get("activity_cache", { type: "json" });
+  if (cached && cached.data && cached.ts && (Date.now() - cached.ts < 300000)) {
+    return cached.data;
+  }
   const repos = config.watchRepos || [];
   if (repos.length === 0) return { activity: [] };
   const results = await Promise.allSettled(
@@ -370,7 +375,10 @@ async function getReposActivity(config) {
       return result;
     })
   );
-  return { activity: results.filter(r => r.status === "fulfilled").map(r => r.value) };
+  const result = { activity: results.filter(r => r.status === "fulfilled").map(r => r.value) };
+  // Write cache (fire-and-forget)
+  env.WATCHER_STATE.put("activity_cache", JSON.stringify({ data: result, ts: Date.now() }), { expirationTtl: 600 }).catch(() => {});
+  return result;
 }
 
 async function getStarredRepos(config) {
@@ -1515,10 +1523,14 @@ function getHTML() {
 
     async function removeRepo(repo) {
       if (!confirm('确定要移除 ' + repo + ' 吗？')) return;
-      await fetchAPI('/api/repos/' + encodeURIComponent(repo), { method: 'DELETE' });
-      showToast('仓库已移除');
-      loadRepos();
-      loadStatus();
+      try {
+        await fetchAPI('/api/repos/' + encodeURIComponent(repo), { method: 'DELETE' });
+        showToast('仓库已移除');
+        loadRepos();
+        loadStatus();
+      } catch (e) {
+        showToast('移除失败: ' + e.message, 'error');
+      }
     }
 
     async function loadHistory() {
