@@ -212,9 +212,11 @@ async function removeRepo(repo, env, existingConfig) {
   const before = (config.watchRepos || []).length;
   if (config.watchRepos) {
     config.watchRepos = config.watchRepos.filter((r) => (typeof r === "string" ? r : r.repo) !== repo);
-    await env.WATCHER_STATE.put("config", JSON.stringify(config));
   }
   const removed = (config.watchRepos || []).length < before;
+  if (removed) {
+    await env.WATCHER_STATE.put("config", JSON.stringify(config));
+  }
   return { success: true, removed, repos: config.watchRepos };
 }
 
