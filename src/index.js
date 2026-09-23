@@ -1160,7 +1160,7 @@ function getHTML() {
         inner.style.opacity = '0';
       }
       detail.addEventListener('click', e => {
-        if (e.target.closest('button')) return;
+        if (e.target.closest('button, input, textarea, select, label')) return;
         e.preventDefault();
         if (detail.open) {
           inner.style.overflow = 'hidden';
