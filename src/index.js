@@ -260,9 +260,11 @@ function maskConfigTokens(config) {
     return s.slice(0, 4) + "••••" + s.slice(-4);
   };
   return {
-    ...config,
     telegramBotToken: mask(config.telegramBotToken),
+    telegramChatId: config.telegramChatId,
     githubToken: mask(config.githubToken),
+    watchRepos: config.watchRepos,
+    updatedAt: config.updatedAt,
   };
 }
 
@@ -624,6 +626,7 @@ function getHTML() {
       --history-commits: #ff9500;
       --history-action: #a855f7;
       --history-error: #ff3b30;
+      --toast-error: #ff3b30;
     }
     [data-theme="light"] {
       --bg-gradient: linear-gradient(135deg, #e8edf5 0%, #d5dde8 100%);
@@ -670,6 +673,7 @@ function getHTML() {
       --history-commits: #e67e00;
       --history-action: #7c3aed;
       --history-error: #d32f2f;
+      --toast-error: #d32f2f;
     }
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -860,7 +864,7 @@ function getHTML() {
     }
     .toast.show { transform: translateY(0); opacity: 1; }
     .toast.success { background: var(--toast-success-bg); color: var(--toast-success-color); }
-    .toast.error { background: #ff3b30; }
+    .toast.error { background: var(--toast-error); }
     .loading { opacity: 0.5; pointer-events: none; }
     .empty-state {
       text-align: center;
@@ -1206,7 +1210,7 @@ function getHTML() {
       const toast = document.getElementById('toast');
       if (_toastTimer) clearTimeout(_toastTimer);
       toast.textContent = msg;
-      toast.className = 'toast ' + type;
+      toast.className = 'toast show ' + type;
       _toastTimer = setTimeout(() => { toast.className = 'toast'; _toastTimer = null; }, 3000);
     }
 
@@ -1268,6 +1272,7 @@ function getHTML() {
       const ghInput = document.getElementById('github-token');
       tokenInput.value = '';
       tokenInput.placeholder = config.telegramBotToken ? config.telegramBotToken : '从 @BotFather 获取';
+      tokenInput.dataset.hasValue = config.telegramBotToken ? '1' : '0';
       document.getElementById('telegram-chat-id').value = config.telegramChatId || '';
       ghInput.value = '';
       ghInput.placeholder = config.githubToken ? config.githubToken : '提升 API 速率限制';
@@ -1280,10 +1285,12 @@ function getHTML() {
         const tokenVal = document.getElementById('telegram-token').value.trim();
         const ghVal = document.getElementById('github-token').value.trim();
         const body = {
-          telegramBotToken: tokenVal || undefined,
           telegramChatId: document.getElementById('telegram-chat-id').value.trim(),
           githubToken: ghVal,
         };
+        if (tokenVal || document.getElementById('telegram-token').dataset.hasValue === '1') {
+          body.telegramBotToken = tokenVal;
+        }
         await fetchAPI('/api/config', { method: 'POST', body: JSON.stringify(body) });
         showToast('设置已保存');
         loadConfig();
@@ -1414,7 +1421,6 @@ function getHTML() {
         const name = escapeHTML(h.name || h.tag || '');
         const sha = escapeHTML(h.sha || '');
         const msg = escapeHTML(h.message || '');
-        const err = escapeHTML(h.message || '');
         let content = '';
         if (h.type === 'release') {
           content = '🏷️ <b>新版本发布</b> ' + repo + ' - ' + name;
@@ -1426,9 +1432,9 @@ function getHTML() {
           const concl = h.conclusion === 'success' ? '✅' : h.conclusion === 'failure' ? '❌' : '⚠️';
           content = concl + ' <b>Actions</b> ' + repo + ' - ' + escapeHTML(h.name || '');
         } else if (h.type === 'error') {
-          content = '❌ <b>错误</b> ' + repo + ': ' + err;
+          content = '❌ <b>错误</b> ' + repo + ': ' + msg;
         }
-        return '<div class="history-item ' + h.type + '">' + content +
+        return '<div class="history-item ' + escapeHTML(h.type || '') + '">' + content +
                '<div class="history-meta">' + new Date(h.timestamp).toLocaleString('zh-CN') + '</div></div>';
       }).join('');
     }
