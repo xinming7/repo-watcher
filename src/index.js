@@ -117,8 +117,19 @@ export default {
       if (path === "/api/github/starred" && method === "GET") {
         return jsonResponse(await getStarredRepos(config), corsHeaders);
       }
+      if (path === "/api/stars/history" && method === "GET") {
+        return jsonResponse(await getStarsHistory(config, env), corsHeaders);
+      }
       if (path === "/api/repos/activity" && method === "GET") {
         return jsonResponse(await getReposActivity(config, env), corsHeaders);
+      }
+      if (path === "/api/quota" && method === "GET") {
+        try {
+          const rateLimit = await githubAPI('/rate_limit', config);
+          return jsonResponse(rateLimit, corsHeaders);
+        } catch (e) {
+          return jsonResponse({ error: e.message }, corsHeaders, 500);
+        }
       }
       if (path === "/api/cron/trigger" && method === "POST") {
         const secret = env.CRON_SECRET;
@@ -131,6 +142,15 @@ export default {
         }
         const result = await checkAllRepos(env);
         return jsonResponse({ ok: true, ...result }, corsHeaders);
+      }
+
+      // RSS feed
+      if (path === "/rss" || path === "/rss.xml") {
+        const history = (await env.WATCHER_STATE.get("history", { type: "json" })) || [];
+        const baseUrl = url.origin;
+        return new Response(generateRSS(history, baseUrl), {
+          headers: { "Content-Type": "application/rss+xml; charset=utf-8", ...corsHeaders },
+        });
       }
 
       // Serve frontend
@@ -147,12 +167,12 @@ export default {
 
 async function getConfig(env) {
   const config = await env.WATCHER_STATE.get("config", { type: "json" });
-  if (!config) return { telegramBotToken: "", telegramChatId: "", watchRepos: [], authPassword: "" };
+  if (!config) return { telegramBotToken: "", telegramChatId: "", watchRepos: [], authPassword: "", filters: {}, keywordAlerts: [] };
   // Migrate old string format to object format
   if (config.watchRepos && config.watchRepos.length > 0 && typeof config.watchRepos[0] === "string") {
     config.watchRepos = config.watchRepos.map(r => ({
       repo: r,
-      watch: { releases: true, commits: true, actions: false },
+      watch: { releases: true, commits: true, actions: false, issues: false, prs: false },
     }));
     await env.WATCHER_STATE.put("config", JSON.stringify(config));
   }
@@ -167,6 +187,14 @@ async function saveConfig(body, env, existingConfig) {
     githubToken: "githubToken" in body ? body.githubToken : existing.githubToken,
     watchRepos: body.watchRepos !== undefined ? body.watchRepos : existing.watchRepos,
     authPassword: body.authPassword !== undefined ? body.authPassword : existing.authPassword,
+    // Notification channels
+    notifyDiscord: body.notifyDiscord !== undefined ? body.notifyDiscord : existing.notifyDiscord,
+    notifyWebhook: body.notifyWebhook !== undefined ? body.notifyWebhook : existing.notifyWebhook,
+    notifyEmail: body.notifyEmail !== undefined ? body.notifyEmail : existing.notifyEmail,
+    // Filters
+    filters: body.filters !== undefined ? body.filters : (existing.filters || {}),
+    // Keyword alerts
+    keywordAlerts: body.keywordAlerts !== undefined ? body.keywordAlerts : (existing.keywordAlerts || []),
     updatedAt: new Date().toISOString(),
   };
   await env.WATCHER_STATE.put("config", JSON.stringify(config));
@@ -179,10 +207,21 @@ async function saveConfig(body, env, existingConfig) {
 async function getRepos(env, existingConfig) {
   const config = existingConfig || await getConfig(env);
   const repos = (config.watchRepos || []).map(r => {
-    if (typeof r === "string") return { repo: r, watch: { releases: true, commits: true, actions: false } };
+    if (typeof r === "string") return { repo: r, watch: { releases: true, commits: true, actions: false, issues: false, prs: false } };
     return r;
   });
   return { repos };
+}
+
+function normalizeWatch(w) {
+  if (!w) return { releases: true, commits: true, actions: false, issues: false, prs: false };
+  return {
+    releases: w.releases !== undefined ? w.releases : true,
+    commits: w.commits !== undefined ? w.commits : true,
+    actions: w.actions !== undefined ? w.actions : false,
+    issues: w.issues !== undefined ? w.issues : false,
+    prs: w.prs !== undefined ? w.prs : false,
+  };
 }
 
 function parseRepoInput(input) {
@@ -210,14 +249,14 @@ async function addRepo(repo, watch, env, existingConfig) {
   if (!config.watchRepos) config.watchRepos = [];
   const exists = config.watchRepos.find(r => (typeof r === "string" ? r : r.repo) === repo);
   if (exists) {
-    return { success: true, added: false, repos: config.watchRepos.map(r => typeof r === "string" ? { repo: r, watch: { releases: true, commits: true, actions: false } } : r) };
+    return { success: true, added: false, repos: config.watchRepos.map(r => typeof r === "string" ? { repo: r, watch: { releases: true, commits: true, actions: false, issues: false, prs: false } } : r) };
   }
   config.watchRepos.push({
     repo,
-    watch: watch || { releases: true, commits: true, actions: false },
+    watch: watch || { releases: true, commits: true, actions: false, issues: false, prs: false },
   });
   await env.WATCHER_STATE.put("config", JSON.stringify(config));
-  return { success: true, added: true, repos: config.watchRepos.map(r => typeof r === "string" ? { repo: r, watch: { releases: true, commits: true, actions: false } } : r) };
+  return { success: true, added: true, repos: config.watchRepos.map(r => typeof r === "string" ? { repo: r, watch: { releases: true, commits: true, actions: false, issues: false, prs: false } } : r) };
 }
 
 async function removeRepo(repo, env, existingConfig) {
@@ -239,7 +278,7 @@ async function updateRepo(repo, watch, env, existingConfig) {
     const idx = config.watchRepos.findIndex((r) => (typeof r === "string" ? r : r.repo) === repo);
     if (idx !== -1) {
       const entry = config.watchRepos[idx];
-      const current = typeof entry === "string" ? { repo: entry, watch: { releases: true, commits: true, actions: false } } : entry;
+      const current = typeof entry === "string" ? { repo: entry, watch: { releases: true, commits: true, actions: false, issues: false, prs: false } } : entry;
       current.watch = { ...current.watch, ...watch };
       config.watchRepos[idx] = current;
       await env.WATCHER_STATE.put("config", JSON.stringify(config));
@@ -272,12 +311,32 @@ async function getStatus(env, existingConfig) {
   const history = (await env.WATCHER_STATE.get("history", { type: "json" })) || [];
   const lastCheck = history.length > 0 ? history[0].timestamp : null;
 
+  // Fetch GitHub API rate limit
+  let apiQuota = null;
+  try {
+    const rateLimit = await githubAPI('/rate_limit', config);
+    if (rateLimit && rateLimit.rate) {
+      apiQuota = {
+        limit: rateLimit.rate.limit,
+        remaining: rateLimit.rate.remaining,
+        reset: new Date(rateLimit.rate.reset * 1000).toISOString(),
+      };
+    }
+  } catch (e) { /* ignore */ }
+
+  const channels = [];
+  if (config.telegramBotToken && config.telegramChatId) channels.push('Telegram');
+  if (config.notifyDiscord) channels.push('Discord');
+  if (config.notifyWebhook) channels.push('Webhook');
+
   return {
     reposCount: (config.watchRepos || []).length,
     notificationsSent: history.length,
     lastCheck,
     telegramConfigured: !!(config.telegramBotToken && config.telegramChatId),
+    channels,
     cronSchedule: env.CRON_SCHEDULE || "*/30 * * * *",
+    apiQuota,
   };
 }
 
@@ -293,6 +352,11 @@ function maskConfigTokens(config) {
     telegramChatId: config.telegramChatId,
     githubToken: mask(config.githubToken),
     watchRepos: config.watchRepos,
+    notifyDiscord: config.notifyDiscord || "",
+    notifyWebhook: config.notifyWebhook || "",
+    notifyEmail: config.notifyEmail || "",
+    filters: config.filters || {},
+    keywordAlerts: config.keywordAlerts || [],
     updatedAt: config.updatedAt,
   };
 }
@@ -399,6 +463,31 @@ async function getReposActivity(config, env) {
   return result;
 }
 
+
+
+async function getStarsHistory(config, env) {
+  const repos = config.watchRepos || [];
+  if (repos.length === 0) return { stars: [] };
+  const results = [];
+  for (const entry of repos.slice(0, 20)) {
+    const repoName = typeof entry === "string" ? entry : entry.repo;
+    try {
+      const repoData = await githubAPI(`/repos/${repoName}`, config);
+      const kvKey = `stars:${repoName}`;
+      const history = (await env.WATCHER_STATE.get(kvKey, { type: "json" })) || [];
+      const current = { stars: repoData.stargazers_count, date: new Date().toISOString().slice(0, 10) };
+      // Only add if date changed or first entry
+      if (history.length === 0 || history[history.length - 1].date !== current.date) {
+        history.push(current);
+        // Keep last 90 entries
+        await env.WATCHER_STATE.put(kvKey, JSON.stringify(history.slice(-90)));
+      }
+      results.push({ repo: repoName, stars: repoData.stargazers_count, history: history.slice(-30) });
+    } catch (e) { /* ignore */ }
+  }
+  return { stars: results };
+}
+
 async function getStarredRepos(config) {
   if (!config.githubToken) {
     throw new Error("GitHub Token not configured. Please set it in Telegram Settings.");
@@ -430,7 +519,7 @@ async function checkAllRepos(env) {
 
   for (const entry of repos) {
     const repoName = typeof entry === "string" ? entry : entry.repo;
-    const watch = typeof entry === "string" ? { releases: true, commits: true, actions: false } : (entry.watch || {});
+    const watch = typeof entry === "string" ? { releases: true, commits: true, actions: false, issues: false, prs: false } : (entry.watch || {});
     try {
       const count = await checkRepo(repoName, watch, config, env);
       notifications += count;
@@ -445,13 +534,17 @@ async function checkAllRepos(env) {
 
 async function checkRepo(repo, watch, config, env) {
   let sent = 0;
-  if (watch.releases) sent += await checkReleases(repo, config, env);
-  if (watch.commits) sent += await checkCommits(repo, config, env);
-  if (watch.actions) sent += await checkActions(repo, config, env);
+  const filters = config.filters || {};
+  if (watch.releases) sent += await checkReleases(repo, config, env, filters);
+  if (watch.commits) sent += await checkCommits(repo, config, env, filters);
+  if (watch.actions) sent += await checkActions(repo, config, env, filters);
+  if (watch.issues) sent += await checkIssues(repo, config, env, filters);
+  if (watch.prs) sent += await checkPRs(repo, config, env, filters);
+  sent += await checkKeywordAlerts(repo, config, env);
   return sent;
 }
 
-async function checkReleases(repo, config, env) {
+async function checkReleases(repo, config, env, filters) {
   const data = await githubAPI(`/repos/${repo}/releases?per_page=5`, config);
   if (!data || !Array.isArray(data) || data.length === 0) return 0;
 
@@ -487,12 +580,20 @@ async function checkReleases(repo, config, env) {
 
     await sendTelegram(message, config);
     await addHistoryEntry({ type: "release", repo, tag, name, url }, env);
+    await reportToUpdateHub(env, {
+      version: tag,
+      title: `${repo} Release: ${name}`,
+      body: release.body ? release.body.slice(0, 500) : '',
+      status: 'changed',
+      diff_url: url,
+      extra: { prerelease: release.prerelease },
+    });
   }
 
   return newReleases.length;
 }
 
-async function checkCommits(repo, config, env) {
+async function checkCommits(repo, config, env, filters) {
   const data = await githubAPI(`/repos/${repo}/commits?per_page=10`, config);
   if (!data || !Array.isArray(data) || data.length === 0) return 0;
 
@@ -530,6 +631,13 @@ async function checkCommits(repo, config, env) {
 
     await sendTelegram(message, config);
     await addHistoryEntry({ type: "commit", repo, sha: shortSha, message: msg, author }, env);
+    await reportToUpdateHub(env, {
+      title: `${repo} Commit: ${shortSha}`,
+      body: msg,
+      status: 'changed',
+      diff_url: c.html_url,
+      extra: { author, sha: shortSha },
+    });
   } else {
     const lines = newCommits
       .reverse()
@@ -549,12 +657,19 @@ async function checkCommits(repo, config, env) {
 
     await sendTelegram(message, config);
     await addHistoryEntry({ type: "commits", repo, count: newCommits.length }, env);
+    await reportToUpdateHub(env, {
+      title: `${repo} ${newCommits.length} new commit(s)`,
+      body: newCommits.map(c => c.commit.message.split('\n')[0]).join('\n').slice(0, 500),
+      status: 'changed',
+      diff_url: `https://github.com/${repo}/compare/${newCommits[newCommits.length - 1].sha.slice(0, 7)}...${newCommits[0].sha.slice(0, 7)}`,
+      extra: { count: newCommits.length },
+    });
   }
 
   return newCommits.length;
 }
 
-async function checkActions(repo, config, env) {
+async function checkActions(repo, config, env, filters) {
   const data = await githubAPI(`/repos/${repo}/actions/runs?per_page=5&status=completed`, config);
   if (!data || !data.workflow_runs || data.workflow_runs.length === 0) return 0;
 
@@ -586,11 +701,140 @@ async function checkActions(repo, config, env) {
       `Date: ${date}\n` +
       `<a href="${run.html_url}">View on GitHub →</a>`;
 
-    await sendTelegram(message, config);
+    // Filter: only failures
+    if (filters.actionsOnlyFailures && run.conclusion === 'success') continue;
+    await sendNotification(message, config);
     await addHistoryEntry({ type: "action", repo, name, conclusion: run.conclusion, url: run.html_url }, env);
+    await reportToUpdateHub(env, {
+      title: `${repo} Actions: ${name}`,
+      body: `Result: ${run.conclusion || 'completed'}`,
+      status: run.conclusion === 'success' ? 'ok' : 'error',
+      diff_url: run.html_url,
+      extra: { conclusion: run.conclusion, branch: run.head_branch },
+    });
   }
 
   return newRuns.length;
+}
+
+
+
+async function checkIssues(repo, config, env, filters) {
+  const data = await githubAPI(`/repos/${repo}/issues?state=open&sort=created&direction=desc&per_page=5`, config);
+  if (!data || !Array.isArray(data) || data.length === 0) return 0;
+
+  const kvKey = `issue:${repo}`;
+  const lastId = await env.WATCHER_STATE.get(kvKey);
+
+  if (!lastId) {
+    await env.WATCHER_STATE.put(kvKey, String(data[0].id));
+    return 0;
+  }
+
+  const lastIdNum = parseInt(lastId, 10);
+  const newIssues = data.filter((i) => i.id > lastIdNum && !i.pull_request);
+  if (newIssues.length === 0) return 0;
+
+  await env.WATCHER_STATE.put(kvKey, String(data[0].id));
+
+  for (const issue of newIssues.reverse()) {
+    const title = issue.title || "untitled";
+    const labels = (issue.labels || []).map(l => l.name);
+    // Filter: ignore labels
+    if (filters.ignoreLabels && filters.ignoreLabels.some(l => labels.includes(l))) continue;
+    const message =
+      `🆕 <b>New Issue</b>\n` +
+      `<b>${escapeHTML(repo)}</b>\n` +
+      `#${issue.number} ${escapeHTML(title)}\n` +
+      `By ${escapeHTML(issue.user?.login || "unknown")}\n` +
+      `<a href="${issue.html_url}">View on GitHub →</a>`;
+
+    await sendNotification(message, config);
+    await addHistoryEntry({ type: "issue", repo, number: issue.number, title, url: issue.html_url }, env);
+  }
+
+  return newIssues.length;
+}
+
+async function checkPRs(repo, config, env, filters) {
+  const data = await githubAPI(`/repos/${repo}/pulls?state=open&sort=created&direction=desc&per_page=5`, config);
+  if (!data || !Array.isArray(data) || data.length === 0) return 0;
+
+  const kvKey = `pr:${repo}`;
+  const lastId = await env.WATCHER_STATE.get(kvKey);
+
+  if (!lastId) {
+    await env.WATCHER_STATE.put(kvKey, String(data[0].id));
+    return 0;
+  }
+
+  const lastIdNum = parseInt(lastId, 10);
+  const newPRs = data.filter((p) => p.id > lastIdNum);
+  if (newPRs.length === 0) return 0;
+
+  await env.WATCHER_STATE.put(kvKey, String(data[0].id));
+
+  for (const pr of newPRs.reverse()) {
+    const title = pr.title || "untitled";
+    const message =
+      `🔀 <b>New Pull Request</b>\n` +
+      `<b>${escapeHTML(repo)}</b>\n` +
+      `#${pr.number} ${escapeHTML(title)}\n` +
+      `By ${escapeHTML(pr.user?.login || "unknown")}\n` +
+      `<a href="${pr.html_url}">View on GitHub →</a>`;
+
+    await sendNotification(message, config);
+    await addHistoryEntry({ type: "pr", repo, number: pr.number, title, url: pr.html_url }, env);
+  }
+
+  return newPRs.length;
+}
+
+async function checkKeywordAlerts(repo, config, env) {
+  const alerts = config.keywordAlerts || [];
+  if (alerts.length === 0) return 0;
+
+  const repoAlerts = alerts.filter(a => a.repo === repo || a.repo === '*');
+  if (repoAlerts.length === 0) return 0;
+
+  // Check recent commits for keyword matches
+  const commits = await githubAPI(`/repos/${repo}/commits?per_page=5`, config);
+  if (!commits || !Array.isArray(commits)) return 0;
+
+  const kvKey = `kw:${repo}`;
+  const lastSha = await env.WATCHER_STATE.get(kvKey);
+  if (!lastSha) {
+    if (commits.length > 0) await env.WATCHER_STATE.put(kvKey, commits[0].sha);
+    return 0;
+  }
+
+  const idx = commits.findIndex(c => c.sha === lastSha);
+  const newCommits = idx === -1 ? commits.slice(0, 3) : commits.slice(0, idx);
+  if (newCommits.length > 0) {
+    await env.WATCHER_STATE.put(kvKey, commits[0].sha);
+  }
+
+  let sent = 0;
+  for (const c of newCommits) {
+    const msg = c.commit.message.toLowerCase();
+    for (const alert of repoAlerts) {
+      const keyword = (alert.keyword || '').toLowerCase();
+      if (!keyword) continue;
+      if (msg.includes(keyword)) {
+        const shortSha = c.sha.slice(0, 7);
+        const message =
+          `🔔 <b>Keyword Alert</b>\n` +
+          `<b>${escapeHTML(repo)}</b>\n` +
+          `Keyword: <code>${escapeHTML(alert.keyword)}</code>\n` +
+          `<code>${shortSha}</code> ${escapeHTML(c.commit.message.split("\\n")[0])}\n` +
+          `<a href="${c.html_url}">View on GitHub →</a>`;
+        await sendNotification(message, config);
+        await addHistoryEntry({ type: "keyword", repo, keyword: alert.keyword, sha: shortSha }, env);
+        sent++;
+      }
+    }
+  }
+  return sent;
 }
 
 // ── GitHub API helper ──
@@ -612,6 +856,57 @@ async function githubAPI(path, config) {
     throw new Error(`GitHub API ${res.status}: ${text}`);
   }
   return res.json();
+}
+
+// ── Update Hub helper ──
+
+async function reportToUpdateHub(env, { version, title, body, status, diff_url, extra }) {
+  const hubUrl = env.UPDATE_HUB_URL;
+  const hubToken = env.UPDATE_HUB_TOKEN;
+  if (!hubUrl || !hubToken) return;
+  try {
+    const res = await fetch(`${hubUrl}/api/projects/github-repo-watcher/updates`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${hubToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ version, title, body, status, diff_url, extra }),
+    });
+    const result = await res.json();
+    console.log(`Update Hub: ${title} → ${result.recorded ? 'OK' : result.error}`);
+  } catch (err) {
+    console.error(`Update Hub report failed: ${err.message}`);
+  }
+}
+
+
+
+// ── Multi-channel notification ──
+
+async function sendNotification(text, config) {
+  // Always try Telegram
+  await sendTelegram(text, config);
+  // Discord webhook
+  if (config.notifyDiscord) {
+    try {
+      await fetch(config.notifyDiscord, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: text.replace(/<[^>]*>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>') }),
+      });
+    } catch (e) { console.error('Discord notify failed:', e.message); }
+  }
+  // Generic webhook
+  if (config.notifyWebhook) {
+    try {
+      await fetch(config.notifyWebhook, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, raw: text.replace(/<[^>]*>/g, '') }),
+      });
+    } catch (e) { console.error('Webhook notify failed:', e.message); }
+  }
 }
 
 // ── Telegram helper ──
@@ -639,6 +934,48 @@ async function sendTelegram(text, config) {
     throw new Error(`Telegram API ${res.status}: ${err}`);
   }
   return res.json();
+}
+
+
+
+// ── RSS Feed ──
+
+function generateRSS(history, baseUrl) {
+  const items = history.slice(0, 50).map(h => {
+    const title = h.type === 'release' ? `${h.repo} Release: ${h.name || h.tag}` :
+                  h.type === 'commit' ? `${h.repo} Commit: ${h.sha}` :
+                  h.type === 'commits' ? `${h.repo} ${h.count} new commits` :
+                  h.type === 'action' ? `${h.repo} Actions: ${h.name}` :
+                  h.type === 'issue' ? `${h.repo} Issue #${h.number}: ${h.title}` :
+                  h.type === 'pr' ? `${h.repo} PR #${h.number}: ${h.title}` :
+                  `${h.repo} Update`;
+    const link = h.url || h.diff_url || `${baseUrl}`;
+    const pubDate = new Date(h.timestamp).toUTCString();
+    return `    <item>
+      <title>${escapeXML(title)}</title>
+      <link>${escapeXML(link)}</link>
+      <guid isPermaLink="false">${h.timestamp}-${h.type}-${h.repo}</guid>
+      <pubDate>${pubDate}</pubDate>
+      <description>${escapeXML(h.message || h.name || h.tag || h.title || '')}</description>
+    </item>`;
+  }).join('\n');
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+<channel>
+  <title>GitHub Repo Watcher</title>
+  <link>${baseUrl}</link>
+  <description>GitHub repository update notifications</description>
+  <language>zh-cn</language>
+  <lastBuildDate>${new Date().toUTCString()}</lastBuildDate>
+  <atom:link href="${baseUrl}/rss" rel="self" type="application/rss+xml"/>
+${items}
+</channel>
+</rss>`;
+}
+
+function escapeXML(str) {
+  return (str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 // ── Utilities ──
@@ -934,6 +1271,29 @@ function getHTML() {
     .history-item.commits { border-color: var(--history-commits); }
     .history-item.action { border-color: var(--history-action); }
     .history-item.error { border-color: var(--history-error); }
+    .history-item.issue { border-color: #ff9500; }
+    .history-item.pr { border-color: #a855f7; }
+    .history-item.keyword { border-color: #ff3b30; }
+    .quota-bar { height: 8px; border-radius: 4px; background: var(--input-bg); margin-top: 8px; overflow: hidden; }
+    .quota-fill { height: 100%; border-radius: 4px; transition: width 0.3s; }
+    .quota-fill.ok { background: var(--accent-green); }
+    .quota-fill.warn { background: #ff9500; }
+    .quota-fill.danger { background: #ff3b30; }
+    .filter-row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+    .filter-row .form-group { flex: 1; min-width: 200px; margin-bottom: 0; }
+    .keyword-list { list-style: none; margin-top: 10px; }
+    .keyword-item { display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--card-bg); border-radius: 8px; margin-bottom: 6px; border: 1px solid var(--card-border-light); }
+    .keyword-item .kw { font-weight: 600; color: var(--accent); }
+    .keyword-item .repo-tag { font-size: 11px; color: var(--text-dim); background: var(--input-bg); padding: 2px 6px; border-radius: 4px; }
+    .stars-chart { margin-top: 12px; }
+    .stars-row { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--card-border-light); }
+    .stars-row .repo-name { flex: 1; font-weight: 500; color: var(--accent); font-size: 14px; }
+    .stars-row .stars-count { font-weight: 700; color: var(--accent-green); font-size: 16px; }
+    .stars-row .stars-delta { font-size: 12px; color: var(--text-dim); }
+    .channel-badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; margin-right: 4px; }
+    .channel-badge.tg { background: rgba(0,136,204,0.2); color: #0088cc; }
+    .channel-badge.dc { background: rgba(88,101,242,0.2); color: #5865f2; }
+    .channel-badge.wh { background: rgba(255,149,0,0.2); color: #ff9500; }
     .history-meta {
       color: var(--text-dim);
       font-size: 12px;
@@ -1111,6 +1471,8 @@ function getHTML() {
           <label><input type="checkbox" id="opt-releases" checked> 🏷️ Release</label>
           <label><input type="checkbox" id="opt-commits"> 📝 Commit</label>
           <label><input type="checkbox" id="opt-actions"> ⚡ Actions</label>
+          <label><input type="checkbox" id="opt-issues"> 🆕 Issue</label>
+          <label><input type="checkbox" id="opt-prs"> 🔀 PR</label>
           <button class="btn btn-secondary btn-sm" id="btn-import-stars" onclick="showStarredModal()" style="margin-left:auto">⭐ 从 Star 导入</button>
         </div>
       </div>
@@ -1141,7 +1503,13 @@ function getHTML() {
             <div class="stat-value" id="stat-cron">-</div>
             <div class="stat-label">检查频率</div>
           </div>
+          <div class="stat-card">
+            <div class="stat-value" id="stat-quota">-</div>
+            <div class="stat-label">API 配额</div>
+            <div class="quota-bar"><div class="quota-fill ok" id="quota-bar-fill" style="width:0%"></div></div>
+          </div>
         </div>
+        <div style="margin-top:12px;color:var(--text-muted);font-size:13px" id="notify-channels"></div>
         <div class="btn-group" style="margin-top: 20px;">
           <button class="btn btn-secondary" id="btn-check-now" onclick="checkNow()">🔄 立即检查</button>
           <button class="btn btn-secondary" id="btn-test-tg" onclick="testTelegram()">💬 测试 Telegram</button>
@@ -1149,17 +1517,25 @@ function getHTML() {
       </div>
     </details>
 
-    <!-- 3. Telegram Settings -->
+    <!-- 3. Notification Channels -->
     <details>
-      <summary><h2>🤖 Telegram 设置</h2></summary>
+      <summary><h2>🔔 通知渠道</h2></summary>
       <div class="card-inner">
         <div class="form-group">
-          <label>Bot Token</label>
+          <label>Telegram Bot Token</label>
           <input type="password" id="telegram-token" placeholder="从 @BotFather 获取">
         </div>
         <div class="form-group">
-          <label>Chat ID</label>
+          <label>Telegram Chat ID</label>
           <input type="text" id="telegram-chat-id" placeholder="私聊或群组的 Chat ID">
+        </div>
+        <div class="form-group">
+          <label>Discord Webhook URL（可选）</label>
+          <input type="text" id="discord-webhook" placeholder="https://discord.com/api/webhooks/...">
+        </div>
+        <div class="form-group">
+          <label>自定义 Webhook URL（可选）</label>
+          <input type="text" id="custom-webhook" placeholder="https://your-server.com/webhook">
         </div>
         <div class="form-group">
           <label>GitHub Token（可选）</label>
@@ -1185,7 +1561,67 @@ function getHTML() {
       </div>
     </details>
 
-    <!-- 5. History -->
+    <!-- 5. Filters -->
+    <details>
+      <summary><h2>🔍 过滤规则</h2></summary>
+      <div class="card-inner">
+        <div class="filter-row">
+          <div class="form-group">
+            <label>忽略 Pre-release</label>
+            <label style="font-weight:normal"><input type="checkbox" id="filter-ignore-pre"> 跳过预发布版本</label>
+          </div>
+          <div class="form-group">
+            <label>仅 Actions 失败通知</label>
+            <label style="font-weight:normal"><input type="checkbox" id="filter-actions-fail"> 只通知失败的 workflow</label>
+          </div>
+        </div>
+        <div class="filter-row">
+          <div class="form-group">
+            <label>忽略的作者（逗号分隔）</label>
+            <input type="text" id="filter-ignore-authors" placeholder="如 dependabot,renovate[bot]">
+          </div>
+          <div class="form-group">
+            <label>忽略的标签（逗号分隔）</label>
+            <input type="text" id="filter-ignore-labels" placeholder="如 duplicate,wontfix">
+          </div>
+        </div>
+        <div class="filter-row">
+          <div class="form-group">
+            <label>Release 标签关键词</label>
+            <input type="text" id="filter-tag-keyword" placeholder="只通知包含此关键词的 tag">
+          </div>
+          <div class="form-group">
+            <label>Commit 消息关键词</label>
+            <input type="text" id="filter-commit-keyword" placeholder="只通知包含此关键词的 commit">
+          </div>
+        </div>
+        <button class="btn btn-primary" id="btn-save-filters" onclick="saveFilters()">💾 保存过滤规则</button>
+      </div>
+    </details>
+
+    <!-- 6. Keyword Alerts -->
+    <details>
+      <summary><h2>🔔 关键词告警</h2></summary>
+      <div class="card-inner">
+        <p style="color:var(--text-muted);font-size:13px;margin-bottom:12px">当 commit 消息包含指定关键词时发送告警通知。仓库填 * 表示所有仓库。</p>
+        <ul class="keyword-list" id="keyword-list"><li class="empty-state">暂无告警规则</li></ul>
+        <div class="add-repo" style="margin-top:12px">
+          <input type="text" id="kw-repo" placeholder="仓库名或 *" style="flex:0.5">
+          <input type="text" id="kw-keyword" placeholder="关键词" style="flex:1">
+          <button class="btn btn-primary" onclick="addKeywordAlert()">➕ 添加</button>
+        </div>
+      </div>
+    </details>
+
+    <!-- 7. Stars Trends -->
+    <details>
+      <summary><h2>⭐ Stars 趋势</h2></summary>
+      <div class="card-inner">
+        <div id="stars-chart"><div class="empty-state">加载中...</div></div>
+      </div>
+    </details>
+
+    <!-- 8. History -->
     <details>
       <summary>
         <h2>📜 通知历史</h2>
@@ -1258,7 +1694,7 @@ function getHTML() {
         inner.style.opacity = '0';
       }
       detail.addEventListener('click', e => {
-        if (e.target.closest('button, input, textarea, select, label')) return;
+        if (e.target.closest('button, input, textarea, select, label, a')) return;
         e.preventDefault();
         if (detail.open) {
           inner.style.overflow = 'hidden';
@@ -1363,6 +1799,22 @@ function getHTML() {
         ? new Date(status.lastCheck).toLocaleString('zh-CN')
         : '从未';
       document.getElementById('stat-cron').textContent = status.cronSchedule || '*/30 * * * *';
+      // API Quota
+      if (status.apiQuota) {
+        const q = status.apiQuota;
+        const pct = Math.round((q.remaining / q.limit) * 100);
+        document.getElementById('stat-quota').textContent = q.remaining + '/' + q.limit;
+        const fill = document.getElementById('quota-bar-fill');
+        fill.style.width = pct + '%';
+        fill.className = 'quota-fill ' + (pct > 30 ? 'ok' : pct > 10 ? 'warn' : 'danger');
+      }
+      // Channels
+      const ch = status.channels || [];
+      if (ch.length > 0) {
+        document.getElementById('notify-channels').innerHTML = '通知渠道: ' + ch.map(c =>
+          '<span class="channel-badge ' + (c === 'Telegram' ? 'tg' : c === 'Discord' ? 'dc' : 'wh') + '">' + c + '</span>'
+        ).join('');
+      }
     }
 
     async function loadConfig() {
@@ -1376,6 +1828,19 @@ function getHTML() {
       ghInput.value = '';
       ghInput.placeholder = config.githubToken ? config.githubToken : '提升 API 速率限制';
       ghInput.dataset.hasValue = config.githubToken ? '1' : '0';
+      // Discord & Webhook
+      document.getElementById('discord-webhook').value = config.notifyDiscord || '';
+      document.getElementById('custom-webhook').value = config.notifyWebhook || '';
+      // Filters
+      const f = config.filters || {};
+      document.getElementById('filter-ignore-pre').checked = !!f.ignorePreRelease;
+      document.getElementById('filter-actions-fail').checked = !!f.actionsOnlyFailures;
+      document.getElementById('filter-ignore-authors').value = (f.ignoreAuthors || []).join(',');
+      document.getElementById('filter-ignore-labels').value = (f.ignoreLabels || []).join(',');
+      document.getElementById('filter-tag-keyword').value = f.tagKeyword || '';
+      document.getElementById('filter-commit-keyword').value = f.commitKeyword || '';
+      // Keyword alerts
+      renderKeywordAlerts(config.keywordAlerts || []);
     }
 
     async function saveConfig() {
@@ -1386,6 +1851,8 @@ function getHTML() {
         const body = {
           telegramChatId: document.getElementById('telegram-chat-id').value.trim(),
           githubToken: ghVal,
+          notifyDiscord: document.getElementById('discord-webhook').value.trim(),
+          notifyWebhook: document.getElementById('custom-webhook').value.trim(),
         };
         if (tokenVal || document.getElementById('telegram-token').dataset.hasValue === '1') {
           body.telegramBotToken = tokenVal;
@@ -1489,6 +1956,8 @@ function getHTML() {
               mkBtn('releases', '🏷️ Release') +
               mkBtn('commits', '📝 Commit') +
               mkBtn('actions', '⚡ Actions') +
+              mkBtn('issues', '🆕 Issue') +
+              mkBtn('prs', '🔀 PR') +
             '</span>' +
             '<button class="btn btn-danger btn-sm" data-remove="' + safe + '">删除</button>' +
           '</div>' +
@@ -1524,6 +1993,8 @@ function getHTML() {
         releases: document.getElementById('opt-releases').checked,
         commits: document.getElementById('opt-commits').checked,
         actions: document.getElementById('opt-actions').checked,
+        issues: document.getElementById('opt-issues').checked,
+        prs: document.getElementById('opt-prs').checked,
       };
       setBtnLoading('btn-add-repo', true);
       try {
@@ -1581,6 +2052,12 @@ function getHTML() {
         } else if (h.type === 'action') {
           const concl = h.conclusion === 'success' ? '✅' : h.conclusion === 'failure' ? '❌' : '⚠️';
           content = concl + ' <b>Actions</b> ' + repo + ' - ' + escapeHTML(h.name || '');
+        } else if (h.type === 'issue') {
+          content = '🆕 <b>New Issue</b> ' + repo + ' #' + escapeHTML(String(h.number || '')) + ' ' + escapeHTML(h.title || '');
+        } else if (h.type === 'pr') {
+          content = '🔀 <b>New PR</b> ' + repo + ' #' + escapeHTML(String(h.number || '')) + ' ' + escapeHTML(h.title || '');
+        } else if (h.type === 'keyword') {
+          content = '🔔 <b>关键词告警</b> ' + repo + ' <code>' + escapeHTML(h.keyword || '') + '</code> ' + escapeHTML(h.sha || '');
         } else if (h.type === 'error') {
           content = '❌ <b>错误</b> ' + repo + ': ' + msg;
         }
@@ -1698,6 +2175,8 @@ function getHTML() {
         releases: document.getElementById('opt-releases').checked,
         commits: document.getElementById('opt-commits').checked,
         actions: document.getElementById('opt-actions').checked,
+        issues: document.getElementById('opt-issues').checked,
+        prs: document.getElementById('opt-prs').checked,
       };
       setBtnLoading('btn-add-starred', true);
       let added = 0;
@@ -1715,9 +2194,99 @@ function getHTML() {
       loadStatus();
     }
 
+
+    // Filter save
+    async function saveFilters() {
+      setBtnLoading('btn-save-filters', true);
+      try {
+        const body = {
+          filters: {
+            ignorePreRelease: document.getElementById('filter-ignore-pre').checked,
+            actionsOnlyFailures: document.getElementById('filter-actions-fail').checked,
+            ignoreAuthors: document.getElementById('filter-ignore-authors').value.split(',').map(s => s.trim()).filter(Boolean),
+            ignoreLabels: document.getElementById('filter-ignore-labels').value.split(',').map(s => s.trim()).filter(Boolean),
+            tagKeyword: document.getElementById('filter-tag-keyword').value.trim(),
+            commitKeyword: document.getElementById('filter-commit-keyword').value.trim(),
+          }
+        };
+        await fetchAPI('/api/config', { method: 'POST', body: JSON.stringify(body) });
+        showToast('过滤规则已保存');
+      } catch (e) {
+        showToast('保存失败: ' + e.message, 'error');
+      } finally {
+        setBtnLoading('btn-save-filters', false);
+      }
+    }
+
+    // Keyword alerts
+    function renderKeywordAlerts(alerts) {
+      const list = document.getElementById('keyword-list');
+      if (!alerts || alerts.length === 0) {
+        list.innerHTML = '<li class="empty-state">暂无告警规则</li>';
+        return;
+      }
+      list.innerHTML = alerts.map((a, i) =>
+        '<li class="keyword-item">' +
+          '<span class="repo-tag">' + escapeHTML(a.repo || '*') + '</span>' +
+          '<span class="kw">' + escapeHTML(a.keyword) + '</span>' +
+          '<button class="btn btn-danger btn-sm" onclick="removeKeywordAlert(' + i + ')" style="margin-left:auto">删除</button>' +
+        '</li>'
+      ).join('');
+    }
+
+    async function addKeywordAlert() {
+      const repo = document.getElementById('kw-repo').value.trim() || '*';
+      const keyword = document.getElementById('kw-keyword').value.trim();
+      if (!keyword) { showToast('请输入关键词', 'error'); return; }
+      try {
+        const config = await fetchAPI('/api/config');
+        const alerts = config.keywordAlerts || [];
+        alerts.push({ repo, keyword });
+        await fetchAPI('/api/config', { method: 'POST', body: JSON.stringify({ keywordAlerts: alerts }) });
+        document.getElementById('kw-repo').value = '';
+        document.getElementById('kw-keyword').value = '';
+        renderKeywordAlerts(alerts);
+        showToast('告警规则已添加');
+      } catch (e) { showToast('添加失败: ' + e.message, 'error'); }
+    }
+
+    async function removeKeywordAlert(index) {
+      try {
+        const config = await fetchAPI('/api/config');
+        const alerts = config.keywordAlerts || [];
+        alerts.splice(index, 1);
+        await fetchAPI('/api/config', { method: 'POST', body: JSON.stringify({ keywordAlerts: alerts }) });
+        renderKeywordAlerts(alerts);
+        showToast('已删除');
+      } catch (e) { showToast('删除失败: ' + e.message, 'error'); }
+    }
+
+    // Stars trends
+    async function loadStars() {
+      try {
+        const { stars } = await fetchAPI('/api/stars/history');
+        const container = document.getElementById('stars-chart');
+        if (!stars || stars.length === 0) {
+          container.innerHTML = '<div class="empty-state">暂无数据</div>';
+          return;
+        }
+        container.innerHTML = stars.map(s => {
+          const delta = s.history.length >= 2 ? s.stars - s.history[0].stars : 0;
+          const deltaStr = delta > 0 ? '+' + delta : delta < 0 ? String(delta) : '';
+          return '<div class="stars-row">' +
+            '<span class="repo-name"><a href="https://github.com/' + escapeHTML(s.repo) + '" target="_blank">' + escapeHTML(s.repo) + '</a></span>' +
+            '<span class="stars-count">⭐ ' + s.stars.toLocaleString() + '</span>' +
+            (deltaStr ? '<span class="stars-delta">(' + deltaStr + ')</span>' : '') +
+          '</div>';
+        }).join('');
+      } catch (e) {
+        document.getElementById('stars-chart').innerHTML = '<div class="empty-state">加载失败</div>';
+      }
+    }
+
     // Init
     async function initApp() {
-      await Promise.all([loadStatus(), loadConfig(), loadRepos(), loadHistory()]);
+      await Promise.all([loadStatus(), loadConfig(), loadRepos(), loadHistory(), loadStars()]);
     }
 
     (async function init() {
