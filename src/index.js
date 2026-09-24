@@ -173,7 +173,7 @@ export default {
 
 async function getConfig(env) {
   const config = await env.WATCHER_STATE.get("config", { type: "json" });
-  if (!config) return { telegramBotToken: "", telegramChatId: "", watchRepos: [], authPassword: "", filters: {}, keywordAlerts: [], notifySlack: "", notificationPriority: "normal", starMilestones: [100, 500, 1000], weeklySummary: false };
+  if (!config) return { telegramBotToken: "", telegramChatId: "", watchRepos: [], authPassword: "", filters: {}, keywordAlerts: [], notifySlack: "", starMilestones: [100, 500, 1000], weeklySummary: false };
   // Migrate old string format to object format
   if (config.watchRepos && config.watchRepos.length > 0 && typeof config.watchRepos[0] === "string") {
     config.watchRepos = config.watchRepos.map(r => ({
@@ -201,8 +201,6 @@ async function saveConfig(body, env, existingConfig) {
     // Keyword alerts
     keywordAlerts: body.keywordAlerts !== undefined ? body.keywordAlerts : (existing.keywordAlerts || []),
     notifySlack: body.notifySlack !== undefined ? body.notifySlack : (existing.notifySlack || ""),
-    // Notification priority
-    notificationPriority: body.notificationPriority !== undefined ? body.notificationPriority : (existing.notificationPriority || "normal"),
     // Star milestones
     starMilestones: body.starMilestones !== undefined ? body.starMilestones : (existing.starMilestones || [100, 500, 1000]),
     // Weekly summary
@@ -226,7 +224,7 @@ async function getRepos(env, existingConfig) {
 }
 
 function normalizeWatch(w) {
-  if (!w) return { releases: true, commits: true, actions: false, issues: false, prs: false, forks: false, prReviews: false, priority: 'normal' };
+  if (!w) return { releases: true, commits: true, actions: false, issues: false, prs: false, forks: false, prReviews: false };
   return {
     releases: w.releases !== undefined ? w.releases : true,
     commits: w.commits !== undefined ? w.commits : true,
@@ -374,7 +372,6 @@ function maskConfigTokens(config) {
     filters: config.filters || {},
     keywordAlerts: config.keywordAlerts || [],
     notifySlack: config.notifySlack || "",
-    notificationPriority: config.notificationPriority || "normal",
     starMilestones: config.starMilestones || [100, 500, 1000],
     weeklySummary: config.weeklySummary || false,
     updatedAt: config.updatedAt,
@@ -2223,7 +2220,6 @@ function getHTML() {
       // Slack
       document.getElementById('slack-webhook').value = config.notifySlack || '';
       // Notification settings
-      document.getElementById('notification-priority').value = config.notificationPriority || 'normal';
       document.getElementById('star-milestones').value = (config.starMilestones || [100, 500, 1000]).join(',');
       document.getElementById('weekly-summary').checked = !!config.weeklySummary;
     }
