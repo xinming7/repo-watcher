@@ -252,10 +252,10 @@ async function addRepo(repo, watch, env, existingConfig) {
   }
   config.watchRepos.push({
     repo,
-    watch: watch || { releases: true, commits: true, actions: false, issues: false, prs: false },
+    watch: normalizeWatch(watch),
   });
   await env.WATCHER_STATE.put("config", JSON.stringify(config));
-  return { success: true, added: true, repos: config.watchRepos.map(r => typeof r === "string" ? { repo: r, watch: { releases: true, commits: true, actions: false, issues: false, prs: false } } : r) };
+  return { success: true, added: true, repos: config.watchRepos.map(r => typeof r === "string" ? { repo: r, watch: normalizeWatch() } : r) };
 }
 
 async function removeRepo(repo, env, existingConfig) {
@@ -488,7 +488,7 @@ async function getStarsHistory(config, env) {
 
 async function getStarredRepos(config) {
   if (!config.githubToken) {
-    throw new Error("GitHub Token not configured. Please set it in Telegram Settings.");
+    throw new Error("GitHub Token 未配置，请在「通知渠道」中设置。");
   }
   const data = await githubAPI("/user/starred?per_page=100&sort=updated", config);
   if (!data || !Array.isArray(data)) return { starred: [] };
@@ -631,7 +631,11 @@ async function checkCommits(repo, config, env, filters) {
       `By ${escapeHTML(author)} · ${date}\n` +
       `<a href="${c.html_url}">View on GitHub →</a>`;
 
-    await sendTelegram(message, config);
+    // Filter: ignore authors
+    if (filters.ignoreAuthors && filters.ignoreAuthors.some(a => author.toLowerCase().includes(a.toLowerCase()))) { return 0; }
+    // Filter: commit keyword
+    if (filters.commitKeyword && !msg.toLowerCase().includes(filters.commitKeyword.toLowerCase())) { return 0; }
+    await sendNotification(message, config);
     await addHistoryEntry({ type: "commit", repo, sha: shortSha, message: msg, author }, env);
     await reportToUpdateHub(env, {
       title: `${repo} Commit: ${shortSha}`,
