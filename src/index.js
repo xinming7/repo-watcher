@@ -1408,6 +1408,22 @@ function getHTML() {
       gap: 6px;
       cursor: pointer;
       margin-bottom: 0;
+      padding: 10px 14px;
+      border-radius: 10px;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border-light);
+      transition: border-color 0.2s;
+      width: 100%;
+      box-sizing: border-box;
+    }
+    label:has(input[type="checkbox"]):hover {
+      border-color: var(--accent);
+    }
+    label:has(input[type="checkbox"]) input[type="checkbox"] {
+      width: 18px;
+      height: 18px;
+      accent-color: var(--accent);
+      flex-shrink: 0;
     }
     input, textarea {
       width: 100%;
@@ -1528,6 +1544,7 @@ function getHTML() {
       white-space: nowrap;
       max-width: 100%;
     }
+    .stat-value.small { font-size: 1.1em; }
     .stat-label {
       color: var(--text-muted);
       margin-top: 8px;
@@ -1767,8 +1784,13 @@ function getHTML() {
           </select>
           <select id="repo-sort-priority" onchange="onSortChange()">
             <option value="latest">取最新</option>
-            <option value="release">Release 优先</option>
-            <option value="commit">Commit 优先</option>
+            <option value="release">🏷️ Release</option>
+            <option value="commit">📝 Commit</option>
+            <option value="action">⚡ Actions</option>
+            <option value="issue">🆕 Issue</option>
+            <option value="pr">🔀 PR</option>
+            <option value="fork">🍴 Fork</option>
+            <option value="pr_merge">✅ PR Merge</option>
           </select>
         </div>
         <ul class="repo-list" id="repo-list">
@@ -2161,9 +2183,12 @@ function getHTML() {
       document.getElementById('stat-repos').textContent = status.reposCount;
       document.getElementById('stat-notifications').textContent = status.notificationsSent;
       document.getElementById('stat-telegram').textContent = status.telegramConfigured ? '✅ 已配置' : '❌ 未配置';
-      document.getElementById('stat-last-check').textContent = status.lastCheck
+      const lastCheckEl = document.getElementById('stat-last-check');
+      const lastCheckText = status.lastCheck
         ? new Date(status.lastCheck).toLocaleString('zh-CN')
         : '从未';
+      lastCheckEl.textContent = lastCheckText;
+      lastCheckEl.className = 'stat-value' + (lastCheckText.length > 12 ? ' small' : '');
       document.getElementById('stat-cron').textContent = status.cronSchedule || '*/30 * * * *';
       // API Quota
       if (status.apiQuota) {
@@ -2336,10 +2361,14 @@ function getHTML() {
             const act = actMap[(typeof entry === 'string' ? entry : entry.repo)] || {};
             if (_sortPriority === 'release') return act.latestRelease?.date || '';
             if (_sortPriority === 'commit') return act.latestCommit?.date || '';
-            // latest: 取两者中较新的
-            const rd = act.latestRelease?.date || '';
-            const cd = act.latestCommit?.date || '';
-            return rd > cd ? rd : cd;
+            if (_sortPriority === 'action') return act.latestAction?.date || '';
+            if (_sortPriority === 'issue') return act.latestIssue?.date || '';
+            if (_sortPriority === 'pr') return act.latestPR?.date || '';
+            if (_sortPriority === 'fork') return act.latestFork?.date || '';
+            if (_sortPriority === 'pr_merge') return act.latestPRMerge?.date || '';
+            // latest: 取所有中较新的
+            const dates = [act.latestRelease?.date, act.latestCommit?.date, act.latestAction?.date, act.latestIssue?.date, act.latestPR?.date].filter(Boolean);
+            return dates.sort().pop() || '';
           };
           const ua = getUpdated(a);
           const ub = getUpdated(b);
@@ -2497,7 +2526,7 @@ function getHTML() {
     }
 
     async function removeRepo(repo) {
-      if (!confirm('确定要移除 ' + repo + ' 吗？')) return;
+      if (!confirm('确定要移除 ' + repo + ' 吗？此操作不可撤销。')) return;
       try {
         const data = await fetchAPI('/api/repos/' + encodeURIComponent(repo), { method: 'DELETE' });
         if (data.removed === false) {
@@ -2512,14 +2541,32 @@ function getHTML() {
       }
     }
 
+    let _historyFilter = 'all';
+
+    function setHistoryFilter(days, btn) {
+      _historyFilter = days;
+      document.querySelectorAll('#history-list').forEach(el => el.previousElementSibling?.querySelectorAll?.('.toggle-btn')).forEach(() => {});
+      // Update button states
+      const bar = btn.closest('.sort-bar');
+      if (bar) bar.querySelectorAll('.toggle-btn').forEach(b => b.classList.remove('on'));
+      btn.classList.add('on');
+      loadHistory();
+    }
+
     async function loadHistory() {
-      const { history } = await fetchAPI('/api/history?limit=30');
+      const { history } = await fetchAPI('/api/history?limit=100');
       const list = document.getElementById('history-list');
-      if (history.length === 0) {
+      // Apply time filter
+      let filtered = history;
+      if (_historyFilter !== 'all') {
+        const cutoff = Date.now() - _historyFilter * 24 * 60 * 60 * 1000;
+        filtered = history.filter(h => new Date(h.timestamp).getTime() > cutoff);
+      }
+      if (filtered.length === 0) {
         list.innerHTML = '<div class="empty-state">暂无通知记录</div>';
         return;
       }
-      list.innerHTML = history.map(h => {
+      list.innerHTML = filtered.slice(0, 30).map(h => {
         const repo = escapeHTML(h.repo || '');
         const name = escapeHTML(h.name || h.tag || '');
         const sha = escapeHTML(h.sha || '');
@@ -2752,7 +2799,7 @@ function getHTML() {
       } catch (e) { showToast('删除失败: ' + e.message, 'error'); }
     }
 
-    // Stars trends
+    let _starsSort = 'stars-desc';
     async function loadStars() {
       try {
         const { stars } = await fetchAPI('/api/stars/history');
@@ -2761,7 +2808,18 @@ function getHTML() {
           container.innerHTML = '<div class="empty-state">暂无数据</div>';
           return;
         }
-        container.innerHTML = stars.map(s => {
+        // Sort stars
+        const sorted = stars.slice().sort((a, b) => {
+          const da = a.history.length >= 2 ? a.stars - a.history[0].stars : 0;
+          const db = b.history.length >= 2 ? b.stars - b.history[0].stars : 0;
+          if (_starsSort === 'stars-desc') return b.stars - a.stars;
+          if (_starsSort === 'stars-asc') return a.stars - b.stars;
+          if (_starsSort === 'delta-desc') return db - da;
+          if (_starsSort === 'delta-asc') return da - db;
+          if (_starsSort === 'name') return a.repo.localeCompare(b.repo);
+          return 0;
+        });
+        container.innerHTML = sorted.map(s => {
           const delta = s.history.length >= 2 ? s.stars - s.history[0].stars : 0;
           const deltaStr = delta > 0 ? '+' + delta : delta < 0 ? String(delta) : '';
           return '<div class="stars-row">' +
@@ -2796,7 +2854,7 @@ function getHTML() {
       }
     }
 
-    // Repos comparison
+    let _compareSort = 'stars-desc';
     async function loadCompare() {
       try {
         const { repos } = await fetchAPI('/api/repos/compare');
@@ -2805,10 +2863,27 @@ function getHTML() {
           container.innerHTML = '<div class="empty-state">暂无监控仓库</div>';
           return;
         }
-        container.innerHTML = '<table class="compare-table"><thead><tr>' +
+        // Sort
+        const sorted = repos.slice().sort((a, b) => {
+          if (_compareSort === 'stars-desc') return b.stars - a.stars;
+          if (_compareSort === 'stars-asc') return a.stars - b.stars;
+          if (_compareSort === 'forks-desc') return b.forks - a.forks;
+          if (_compareSort === 'forks-asc') return a.forks - b.forks;
+          if (_compareSort === 'issues-desc') return b.openIssues - a.openIssues;
+          if (_compareSort === 'issues-asc') return a.openIssues - b.openIssues;
+          if (_compareSort === 'name') return a.repo.localeCompare(b.repo);
+          return 0;
+        });
+        container.innerHTML = '<div class="sort-bar" style="margin-bottom:8px"><label>排序：</label>' +
+          '<select id="compare-sort" onchange="_compareSort=this.value;loadCompare()" style="padding:6px 10px;background:var(--input-bg);border:1px solid var(--input-border);border-radius:8px;color:var(--text-primary);font-size:13px">' +
+          '<option value="stars-desc">Stars ↓</option><option value="stars-asc">Stars ↑</option>' +
+          '<option value="forks-desc">Forks ↓</option><option value="forks-asc">Forks ↑</option>' +
+          '<option value="issues-desc">Issues ↓</option><option value="issues-asc">Issues ↑</option>' +
+          '<option value="name">名称</option></select></div>' +
+          '<table class="compare-table"><thead><tr>' +
           '<th>仓库</th><th>⭐ Stars</th><th>🍴 Forks</th><th>📋 Issues</th><th>👁 Watchers</th><th>🔤 语言</th>' +
           '</tr></thead><tbody>' +
-          repos.map(r =>
+          sorted.map(r =>
             '<tr><td><a href="https://github.com/' + escapeHTML(r.repo) + '" target="_blank">' + escapeHTML(r.repo) + '</a></td>' +
             '<td>' + r.stars.toLocaleString() + '</td>' +
             '<td>' + r.forks.toLocaleString() + '</td>' +
