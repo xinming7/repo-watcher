@@ -172,7 +172,7 @@ async function getConfig(env) {
   if (config.watchRepos && config.watchRepos.length > 0 && typeof config.watchRepos[0] === "string") {
     config.watchRepos = config.watchRepos.map(r => ({
       repo: r,
-      watch: { releases: true, commits: true, actions: false, issues: false, prs: false },
+      watch: normalizeWatch(),
     }));
     await env.WATCHER_STATE.put("config", JSON.stringify(config));
   }
@@ -190,7 +190,6 @@ async function saveConfig(body, env, existingConfig) {
     // Notification channels
     notifyDiscord: body.notifyDiscord !== undefined ? body.notifyDiscord : existing.notifyDiscord,
     notifyWebhook: body.notifyWebhook !== undefined ? body.notifyWebhook : existing.notifyWebhook,
-    notifyEmail: body.notifyEmail !== undefined ? body.notifyEmail : existing.notifyEmail,
     // Filters
     filters: body.filters !== undefined ? body.filters : (existing.filters || {}),
     // Keyword alerts
@@ -207,7 +206,7 @@ async function saveConfig(body, env, existingConfig) {
 async function getRepos(env, existingConfig) {
   const config = existingConfig || await getConfig(env);
   const repos = (config.watchRepos || []).map(r => {
-    if (typeof r === "string") return { repo: r, watch: { releases: true, commits: true, actions: false, issues: false, prs: false } };
+    if (typeof r === "string") return { repo: r, watch: normalizeWatch() };
     return r;
   });
   return { repos };
@@ -249,7 +248,7 @@ async function addRepo(repo, watch, env, existingConfig) {
   if (!config.watchRepos) config.watchRepos = [];
   const exists = config.watchRepos.find(r => (typeof r === "string" ? r : r.repo) === repo);
   if (exists) {
-    return { success: true, added: false, repos: config.watchRepos.map(r => typeof r === "string" ? { repo: r, watch: { releases: true, commits: true, actions: false, issues: false, prs: false } } : r) };
+    return { success: true, added: false, repos: config.watchRepos.map(r => typeof r === "string" ? { repo: r, watch: normalizeWatch() } : r) };
   }
   config.watchRepos.push({
     repo,
@@ -278,7 +277,7 @@ async function updateRepo(repo, watch, env, existingConfig) {
     const idx = config.watchRepos.findIndex((r) => (typeof r === "string" ? r : r.repo) === repo);
     if (idx !== -1) {
       const entry = config.watchRepos[idx];
-      const current = typeof entry === "string" ? { repo: entry, watch: { releases: true, commits: true, actions: false, issues: false, prs: false } } : entry;
+      const current = typeof entry === "string" ? { repo: entry, watch: normalizeWatch() } : entry;
       current.watch = { ...current.watch, ...watch };
       config.watchRepos[idx] = current;
       await env.WATCHER_STATE.put("config", JSON.stringify(config));
@@ -354,7 +353,6 @@ function maskConfigTokens(config) {
     watchRepos: config.watchRepos,
     notifyDiscord: config.notifyDiscord || "",
     notifyWebhook: config.notifyWebhook || "",
-    notifyEmail: config.notifyEmail || "",
     filters: config.filters || {},
     keywordAlerts: config.keywordAlerts || [],
     updatedAt: config.updatedAt,
@@ -519,7 +517,7 @@ async function checkAllRepos(env) {
 
   for (const entry of repos) {
     const repoName = typeof entry === "string" ? entry : entry.repo;
-    const watch = typeof entry === "string" ? { releases: true, commits: true, actions: false, issues: false, prs: false } : (entry.watch || {});
+    const watch = typeof entry === "string" ? normalizeWatch() : normalizeWatch(entry.watch);
     try {
       const count = await checkRepo(repoName, watch, config, env);
       notifications += count;
@@ -578,7 +576,11 @@ async function checkReleases(repo, config, env, filters) {
       `Date: ${date}\n` +
       `<a href="${url}">View on GitHub →</a>`;
 
-    await sendTelegram(message, config);
+    // Filter: skip pre-release if configured
+    if (filters.ignorePreRelease && release.prerelease) continue;
+    // Filter: tag keyword
+    if (filters.tagKeyword && !tag.toLowerCase().includes(filters.tagKeyword.toLowerCase())) continue;
+    await sendNotification(message, config);
     await addHistoryEntry({ type: "release", repo, tag, name, url }, env);
     await reportToUpdateHub(env, {
       version: tag,
@@ -655,7 +657,7 @@ async function checkCommits(repo, config, env, filters) {
       `<b>${escapeHTML(repo)}</b>\n${lines}\n` +
       `<a href="${compareUrl}">View changes →</a>`;
 
-    await sendTelegram(message, config);
+    await sendNotification(message, config);
     await addHistoryEntry({ type: "commits", repo, count: newCommits.length }, env);
     await reportToUpdateHub(env, {
       title: `${repo} ${newCommits.length} new commit(s)`,
@@ -826,7 +828,7 @@ async function checkKeywordAlerts(repo, config, env) {
           `🔔 <b>Keyword Alert</b>\n` +
           `<b>${escapeHTML(repo)}</b>\n` +
           `Keyword: <code>${escapeHTML(alert.keyword)}</code>\n` +
-          `<code>${shortSha}</code> ${escapeHTML(c.commit.message.split("\\n")[0])}\n` +
+          `<code>${shortSha}</code> ${escapeHTML(c.commit.message.split("\n")[0])}\n` +
           `<a href="${c.html_url}">View on GitHub →</a>`;
         await sendNotification(message, config);
         await addHistoryEntry({ type: "keyword", repo, keyword: alert.keyword, sha: shortSha }, env);
