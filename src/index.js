@@ -219,8 +219,8 @@ async function saveConfig(body, env, existingConfig) {
 async function getRepos(env, existingConfig) {
   const config = existingConfig || await getConfig(env);
   const repos = (config.watchRepos || []).map(r => {
-    if (typeof r === "string") return { repo: r, watch: normalizeWatch() };
-    return r;
+    if (typeof r === "string") return { repo: r, watch: normalizeWatch(), pinned: false };
+    return { ...r, pinned: !!r.pinned };
   });
   return { repos };
 }
@@ -293,7 +293,8 @@ async function updateRepo(repo, watch, env, existingConfig) {
     if (idx !== -1) {
       const entry = config.watchRepos[idx];
       const current = typeof entry === "string" ? { repo: entry, watch: normalizeWatch() } : entry;
-      current.watch = { ...current.watch, ...watch };
+      if (watch) current.watch = { ...current.watch, ...watch };
+      if (body.pinned !== undefined) current.pinned = !!body.pinned;
       config.watchRepos[idx] = current;
       await env.WATCHER_STATE.put("config", JSON.stringify(config));
     }
@@ -1465,6 +1466,15 @@ function getHTML() {
     .repo-list {
       list-style: none;
     }
+    .repo-item.pinned { border-color: var(--accent); background: var(--toggle-on-bg); }
+    .repo-item.pinned .repo-name a { font-weight: 700; }
+    .pin-btn { background: none; border: none; cursor: pointer; font-size: 16px; padding: 2px 6px; border-radius: 6px; transition: all 0.2s; }
+    .pin-btn:hover { background: var(--btn-secondary-hover); }
+    .pin-btn.pinned { color: #ffd700; }
+    .pin-btn:not(.pinned) { color: var(--text-dim); }
+    .sort-bar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+    .sort-bar label { font-size: 13px; color: var(--text-muted); margin-bottom: 0; }
+    .sort-bar select { padding: 6px 10px; background: var(--input-bg); border: 1px solid var(--input-border); border-radius: 8px; color: var(--text-primary); font-size: 13px; }
     .repo-item {
       display: flex;
       justify-content: space-between;
@@ -1737,6 +1747,19 @@ function getHTML() {
     <details open>
       <summary><h2>📦 监控仓库</h2></summary>
       <div class="card-inner">
+        <div class="sort-bar">
+          <label>排序：</label>
+          <select id="repo-sort-field" onchange="onSortChange()">
+            <option value="default">默认</option>
+            <option value="name">名称</option>
+            <option value="created">创建时间</option>
+            <option value="updated">更新时间</option>
+          </select>
+          <select id="repo-sort-dir" onchange="onSortChange()">
+            <option value="asc">正序 ↑</option>
+            <option value="desc">倒序 ↓</option>
+          </select>
+        </div>
         <ul class="repo-list" id="repo-list">
           <li class="empty-state">暂无监控仓库，请添加</li>
         </ul>
@@ -2009,7 +2032,7 @@ function getHTML() {
       if (!localStorage.getItem('grw_theme') || localStorage.getItem('grw_theme') === 'auto') applyTheme('auto');
     });
 
-    // Collapsible animation
+    // Collapsible animation — only bind to <summary>, not the whole <details>
     document.querySelectorAll('details').forEach(detail => {
       const inner = detail.querySelector('.card-inner');
       if (!inner) return;
@@ -2017,28 +2040,36 @@ function getHTML() {
         inner.style.maxHeight = '0';
         inner.style.opacity = '0';
       }
-      detail.addEventListener('click', e => {
+      const summary = detail.querySelector('summary');
+      if (!summary) return;
+      summary.addEventListener('click', e => {
         if (e.target.closest('button, input, textarea, select, label, a')) return;
         e.preventDefault();
         if (detail.open) {
+          // Collapse
           inner.style.overflow = 'hidden';
           inner.style.maxHeight = inner.scrollHeight + 'px';
           inner.style.transition = 'max-height 0.3s ease, opacity 0.25s ease';
           requestAnimationFrame(() => {
-            inner.style.maxHeight = '0';
-            inner.style.opacity = '0';
+            requestAnimationFrame(() => {
+              inner.style.maxHeight = '0';
+              inner.style.opacity = '0';
+            });
           });
           setTimeout(() => { detail.removeAttribute('open'); inner.style.transition = ''; }, 300);
         } else {
+          // Expand
           detail.setAttribute('open', '');
           inner.style.overflow = 'hidden';
           inner.style.maxHeight = '0';
           inner.style.opacity = '0';
           requestAnimationFrame(() => {
-            inner.style.transition = 'max-height 0.3s ease, opacity 0.25s ease';
-            inner.style.maxHeight = inner.scrollHeight + 'px';
-            inner.style.opacity = '1';
-            setTimeout(() => { inner.style.maxHeight = ''; inner.style.overflow = ''; inner.style.transition = ''; }, 300);
+            requestAnimationFrame(() => {
+              inner.style.transition = 'max-height 0.3s ease, opacity 0.25s ease';
+              inner.style.maxHeight = inner.scrollHeight + 'px';
+              inner.style.opacity = '1';
+              setTimeout(() => { inner.style.maxHeight = ''; inner.style.overflow = ''; inner.style.transition = ''; }, 300);
+            });
           });
         }
       });
@@ -2246,6 +2277,9 @@ function getHTML() {
       return new Date(dateStr).toLocaleDateString('zh-CN');
     }
 
+    let _sortField = 'default';
+    let _sortAsc = true;
+
     async function loadRepos() {
       const [{ repos }, actData] = await Promise.all([
         fetchAPI('/api/repos'),
@@ -2253,14 +2287,40 @@ function getHTML() {
       ]);
       const actMap = {};
       (actData.activity || []).forEach(a => { actMap[a.repo] = a; });
+
+      // Sort: pinned always first, then by chosen field
+      const sorted = repos.slice().sort((a, b) => {
+        const pa = a.pinned ? 1 : 0;
+        const pb = b.pinned ? 1 : 0;
+        if (pa !== pb) return pb - pa;
+        if (_sortField === 'default') return 0;
+        if (_sortField === 'name') {
+          const ra = (typeof a === 'string' ? a : a.repo).toLowerCase();
+          const rb = (typeof b === 'string' ? b : b.repo).toLowerCase();
+          return _sortAsc ? ra.localeCompare(rb) : rb.localeCompare(ra);
+        }
+        if (_sortField === 'created') {
+          const ca = actMap[(typeof a === 'string' ? a : a.repo)]?.latestCommit?.date || '';
+          const cb = actMap[(typeof b === 'string' ? b : b.repo)]?.latestCommit?.date || '';
+          return _sortAsc ? ca.localeCompare(cb) : cb.localeCompare(ca);
+        }
+        if (_sortField === 'updated') {
+          const ua = actMap[(typeof a === 'string' ? a : a.repo)]?.latestRelease?.date || actMap[(typeof a === 'string' ? a : a.repo)]?.latestCommit?.date || '';
+          const ub = actMap[(typeof b === 'string' ? b : b.repo)]?.latestRelease?.date || actMap[(typeof b === 'string' ? b : b.repo)]?.latestCommit?.date || '';
+          return _sortAsc ? ua.localeCompare(ub) : ub.localeCompare(ua);
+        }
+        return 0;
+      });
+
       const list = document.getElementById('repo-list');
-      if (repos.length === 0) {
+      if (sorted.length === 0) {
         list.innerHTML = '<li class="empty-state">暂无监控仓库，请添加</li>';
         return;
       }
-      list.innerHTML = repos.map(r => {
+      list.innerHTML = sorted.map(r => {
         const repo = typeof r === 'string' ? r : r.repo;
         const w = (typeof r === 'string' ? {} : r.watch) || {};
+        const pinned = r.pinned || false;
         const safe = escapeHTML(repo);
         const act = actMap[repo];
         const mkBtn = (key, label) => '<button class="toggle-btn ' + (w[key] ? 'on' : '') + '" data-repo="' + safe + '" data-watch="' + key + '">' + label + '</button>';
@@ -2280,8 +2340,9 @@ function getHTML() {
             activity = '<div class="repo-activity">' + parts.join('') + '</div>';
           }
         }
-        return '<li class="repo-item">' +
+        return '<li class="repo-item' + (pinned ? ' pinned' : '') + '">' +
           '<div class="repo-row">' +
+            '<button class="pin-btn' + (pinned ? ' pinned' : '') + '" data-pin="' + safe + '" title="' + (pinned ? '取消置顶' : '置顶') + '">' + (pinned ? '📌' : '📍') + '</button>' +
             '<span class="repo-name"><a href="https://github.com/' + safe + '" target="_blank">' + safe + '</a></span>' +
             '<span class="repo-toggles">' +
               mkBtn('releases', '🏷️ Release') +
@@ -2299,9 +2360,27 @@ function getHTML() {
       }).join('');
     }
 
+    function onSortChange() {
+      _sortField = document.getElementById('repo-sort-field').value;
+      _sortAsc = document.getElementById('repo-sort-dir').value === 'asc';
+      loadRepos();
+    }
+
+    async function togglePin(repo) {
+      try {
+        const repos = await fetchAPI('/api/repos');
+        const entry = repos.repos.find(r => (typeof r === 'string' ? r : r.repo) === repo);
+        const currentPinned = entry && typeof entry === 'object' ? !!entry.pinned : false;
+        await fetchAPI('/api/repos/' + encodeURIComponent(repo), { method: 'PUT', body: JSON.stringify({ pinned: !currentPinned }) });
+        loadRepos();
+      } catch (e) { showToast('操作失败: ' + e.message, 'error'); }
+    }
+
     document.addEventListener('click', e => {
       const rmBtn = e.target.closest('[data-remove]');
       if (rmBtn) return removeRepo(rmBtn.dataset.remove);
+      const pinBtn = e.target.closest('[data-pin]');
+      if (pinBtn) return togglePin(pinBtn.dataset.pin);
       const tglBtn = e.target.closest('.toggle-btn[data-repo]');
       if (tglBtn) return toggleRepoWatch(tglBtn.dataset.repo, tglBtn.dataset.watch, tglBtn);
     });
