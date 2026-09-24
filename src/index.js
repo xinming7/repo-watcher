@@ -1408,6 +1408,8 @@ function getHTML() {
       gap: 6px;
       cursor: pointer;
       margin-bottom: 0;
+    }
+    .filter-row label:has(input[type="checkbox"]) {
       padding: 10px 14px;
       border-radius: 10px;
       background: var(--card-bg);
@@ -1416,10 +1418,10 @@ function getHTML() {
       width: 100%;
       box-sizing: border-box;
     }
-    label:has(input[type="checkbox"]):hover {
+    .filter-row label:has(input[type="checkbox"]):hover {
       border-color: var(--accent);
     }
-    label:has(input[type="checkbox"]) input[type="checkbox"] {
+    .filter-row label:has(input[type="checkbox"]) input[type="checkbox"] {
       width: 18px;
       height: 18px;
       accent-color: var(--accent);
@@ -1942,16 +1944,13 @@ function getHTML() {
       <div class="card-inner">
         <div class="filter-row">
           <div class="form-group">
-            <label>默认通知优先级</label>
-            <select id="notification-priority" style="width:100%;padding:12px 16px;background:var(--input-bg);border:1px solid var(--input-border);border-radius:10px;color:var(--text-primary);font-size:14px">
-              <option value="normal">普通</option>
-              <option value="high">高优先级（通知带 🔴 标记）</option>
-            </select>
-          </div>
-          <div class="form-group">
             <label>Star 里程碑（逗号分隔）</label>
             <input type="text" id="star-milestones" placeholder="如 100,500,1000">
             <div class="token-hint">达到这些 Star 数时发送通知</div>
+          </div>
+          <div class="form-group">
+            <label>周报摘要</label>
+            <label style="font-weight:normal"><input type="checkbox" id="weekly-summary"> 启用每周摘要汇总</label>
           </div>
         </div>
         <div class="filter-row">
@@ -1971,7 +1970,7 @@ function getHTML() {
         <ul class="keyword-list" id="keyword-list"><li class="empty-state">暂无告警规则</li></ul>
         <div class="add-repo" style="margin-top:12px">
           <input type="text" id="kw-repo" placeholder="仓库名或 *" style="flex:0.5">
-          <input type="text" id="kw-keyword" placeholder="关键词" style="flex:1">
+          <input type="text" id="kw-keyword" placeholder="如 CVE, security, breaking" style="flex:1">
           <button class="btn btn-primary" onclick="addKeywordAlert()">➕ 添加</button>
         </div>
       </div>
