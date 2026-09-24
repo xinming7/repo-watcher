@@ -1953,11 +1953,6 @@ function getHTML() {
             <label style="font-weight:normal"><input type="checkbox" id="weekly-summary"> 启用每周摘要汇总</label>
           </div>
         </div>
-        <div class="filter-row">
-          <div class="form-group">
-            <label style="font-weight:normal"><input type="checkbox" id="weekly-summary"> 启用每周摘要汇总</label>
-          </div>
-        </div>
         <button class="btn btn-primary" id="btn-save-notify-settings" onclick="saveNotifySettings()">💾 保存通知设置</button>
       </div>
     </details>
@@ -1976,8 +1971,8 @@ function getHTML() {
       </div>
     </details>
 
-    <!-- 7. Stars Trends -->
-    <details>
+    <!-- 7. Stars Trends (hidden) -->
+    <details style="display:none">
       <summary><h2>⭐ Stars 趋势</h2></summary>
       <div class="card-inner">
         <div id="stars-chart"><div class="empty-state">加载中...</div></div>
