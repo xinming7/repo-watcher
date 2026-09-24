@@ -548,13 +548,14 @@ async function checkAllRepos(env) {
     }
   }
 
-  // Weekly summary push: check if today is Monday and weeklySummary is enabled
+  // Weekly summary push: check if today is Monday (UTC+8) and weeklySummary is enabled
   if (config.weeklySummary) {
     const now = new Date();
-    if (now.getDay() === 1) { // Monday
+    const bjTime = new Date(now.getTime() + 8 * 3600 * 1000); // UTC+8
+    if (bjTime.getUTCDay() === 1) { // Monday in Beijing time
       const lastSummaryKey = 'weekly_summary:last';
       const lastSent = await env.WATCHER_STATE.get(lastSummaryKey);
-      const thisMonday = now.toISOString().slice(0, 10);
+      const thisMonday = bjTime.toISOString().slice(0, 10);
       if (lastSent !== thisMonday) {
         await env.WATCHER_STATE.put(lastSummaryKey, thisMonday, { expirationTtl: 604800 });
         const summary = await getWeeklySummary(config, env);
@@ -1034,6 +1035,12 @@ async function getWeeklySummary(config, env) {
 // ── Repos Comparison ──
 
 async function getReposComparison(config, env) {
+  // Check KV cache (5 min TTL)
+  const cached = await env.WATCHER_STATE.get("compare_cache", { type: "json" });
+  if (cached && cached.data && cached.ts && (Date.now() - cached.ts < 300000)) {
+    return cached.data;
+  }
+
   const repos = config.watchRepos || [];
   if (repos.length === 0) return { repos: [] };
 
@@ -1055,7 +1062,10 @@ async function getReposComparison(config, env) {
     } catch (e) { /* skip */ }
   }
 
-  return { repos: results };
+  const result = { repos: results };
+  // Write cache (fire-and-forget)
+  env.WATCHER_STATE.put("compare_cache", JSON.stringify({ data: result, ts: Date.now() }), { expirationTtl: 600 }).catch(() => {});
+  return result;
 }
 
 // ── GitHub API helper ──
