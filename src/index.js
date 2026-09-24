@@ -1839,12 +1839,10 @@ function getHTML() {
       <div class="card-inner">
         <div class="filter-row">
           <div class="form-group">
-            <label>忽略 Pre-release</label>
-            <label style="font-weight:normal"><input type="checkbox" id="filter-ignore-pre"> 跳过预发布版本</label>
+            <label style="font-weight:normal"><input type="checkbox" id="filter-ignore-pre"> 忽略 Pre-release（跳过预发布版本）</label>
           </div>
           <div class="form-group">
-            <label>仅 Actions 失败通知</label>
-            <label style="font-weight:normal"><input type="checkbox" id="filter-actions-fail"> 只通知失败的 workflow</label>
+            <label style="font-weight:normal"><input type="checkbox" id="filter-actions-fail"> 仅 Actions 失败通知（只通知失败的 workflow）</label>
           </div>
         </div>
         <div class="filter-row">
@@ -1891,7 +1889,6 @@ function getHTML() {
         </div>
         <div class="filter-row">
           <div class="form-group">
-            <label>周报摘要</label>
             <label style="font-weight:normal"><input type="checkbox" id="weekly-summary"> 启用每周摘要汇总</label>
           </div>
         </div>
