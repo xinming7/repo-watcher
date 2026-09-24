@@ -200,7 +200,6 @@ async function saveConfig(body, env, existingConfig) {
     filters: body.filters !== undefined ? body.filters : (existing.filters || {}),
     // Keyword alerts
     keywordAlerts: body.keywordAlerts !== undefined ? body.keywordAlerts : (existing.keywordAlerts || []),
-    // Notification channels
     notifySlack: body.notifySlack !== undefined ? body.notifySlack : (existing.notifySlack || ""),
     // Notification priority
     notificationPriority: body.notificationPriority !== undefined ? body.notificationPriority : (existing.notificationPriority || "normal"),
@@ -549,6 +548,42 @@ async function checkAllRepos(env) {
     }
   }
 
+  // Weekly summary push: check if today is Monday and weeklySummary is enabled
+  if (config.weeklySummary) {
+    const now = new Date();
+    if (now.getDay() === 1) { // Monday
+      const lastSummaryKey = 'weekly_summary:last';
+      const lastSent = await env.WATCHER_STATE.get(lastSummaryKey);
+      const thisMonday = now.toISOString().slice(0, 10);
+      if (lastSent !== thisMonday) {
+        await env.WATCHER_STATE.put(lastSummaryKey, thisMonday, { expirationTtl: 604800 });
+        const summary = await getWeeklySummary(config, env);
+        const repos = Object.keys(summary.summary);
+        if (repos.length > 0) {
+          let lines = repos.map(r => {
+            const s = summary.summary[r];
+            const parts = [];
+            if (s.releases) parts.push(`${s.releases}个Release`);
+            if (s.commits) parts.push(`${s.commits}个Commit`);
+            if (s.issues) parts.push(`${s.issues}个Issue`);
+            if (s.prs) parts.push(`${s.prs}个PR`);
+            if (s.prMerges) parts.push(`${s.prMerges}个合并`);
+            if (s.forks) parts.push(`${s.forks}个Fork`);
+            if (s.starMilestones) parts.push(`Star里程碑`);
+            return `• <b>${escapeHTML(r)}</b>: ${parts.join(', ')}`;
+          }).join('\n');
+          const message =
+            `📋 <b>Weekly Summary</b>\n` +
+            `本周共 ${summary.totalEvents} 条事件\n` +
+            lines + '\n' +
+            `<a href="https://github-repo-watcher.xinming.dpdns.org">View Dashboard →</a>`;
+          await sendNotification(message, config);
+          await addHistoryEntry({ type: "weekly_summary", eventCount: summary.totalEvents, repoCount: repos.length }, env);
+          notifications++;
+        }
+      }
+    }
+  }
   return { checked: repos.length, notifications };
 }
 
@@ -560,10 +595,9 @@ async function checkRepo(repo, watch, config, env) {
   if (watch.actions) sent += await checkActions(repo, config, env, filters);
   if (watch.issues) sent += await checkIssues(repo, config, env, filters);
   if (watch.prs) sent += await checkPRs(repo, config, env, filters);
-  if (watch.forks) sent += await checkForks(repo, config, env);
+  sent += await checkRepoMeta(repo, watch, config, env);
   if (watch.prReviews) sent += await checkPRMerges(repo, config, env);
   sent += await checkKeywordAlerts(repo, config, env);
-  sent += await checkStarMilestones(repo, config, env);
   return sent;
 }
 
@@ -869,68 +903,65 @@ async function checkKeywordAlerts(repo, config, env) {
 }
 
 
-// ── Star Milestones ──
+// ── Star Milestones + Fork Monitoring (shared API call) ──
 
-async function checkStarMilestones(repo, config, env) {
-  const milestones = config.starMilestones || [];
-  if (milestones.length === 0) return 0;
+async function checkRepoMeta(repo, watch, config, env) {
+  const needStars = (config.starMilestones || []).length > 0;
+  const needForks = watch.forks;
+  if (!needStars && !needForks) return 0;
 
   try {
     const repoData = await githubAPI(`/repos/${repo}`, config);
-    const currentStars = repoData.stargazers_count;
-    const kvKey = `starMilestone:${repo}`;
-    const lastNotified = parseInt(await env.WATCHER_STATE.get(kvKey) || "0", 10);
+    let sent = 0;
 
-    // Find the highest milestone that has been crossed
-    const crossed = milestones.filter(m => currentStars >= m && m > lastNotified);
-    if (crossed.length === 0) return 0;
-
-    const highestCrossed = Math.max(...crossed);
-    await env.WATCHER_STATE.put(kvKey, String(highestCrossed));
-
-    const message =
-      `⭐ <b>Star Milestone!</b>\n` +
-      `<b>${escapeHTML(repo)}</b>\n` +
-      `Reached <b>${currentStars}</b> stars!\n` +
-      `Milestone: ${crossed.map(m => m.toLocaleString()).join(', ')}\n` +
-      `<a href="https://github.com/${repo}">View on GitHub →</a>`;
-
-    await sendNotification(message, config, 'high');
-    await addHistoryEntry({ type: "star_milestone", repo, stars: currentStars, milestones: crossed, priority: 'high' }, env);
-    return 1;
-  } catch (e) {
-    return 0;
-  }
-}
-
-// ── Fork Monitoring ──
-
-async function checkForks(repo, config, env) {
-  try {
-    const repoData = await githubAPI(`/repos/${repo}`, config);
-    const currentForks = repoData.forks_count;
-    const kvKey = `fork:${repo}`;
-    const lastForks = parseInt(await env.WATCHER_STATE.get(kvKey) || String(currentForks), 10);
-
-    if (!await env.WATCHER_STATE.get(kvKey)) {
-      await env.WATCHER_STATE.put(kvKey, String(currentForks));
-      return 0;
+    // Star milestones
+    if (needStars) {
+      const currentStars = repoData.stargazers_count;
+      const kvKey = `starMilestone:${repo}`;
+      const lastNotifiedStr = await env.WATCHER_STATE.get(kvKey);
+      const lastNotified = parseInt(lastNotifiedStr || "0", 10);
+      const milestones = config.starMilestones || [];
+      const crossed = milestones.filter(m => currentStars >= m && m > lastNotified);
+      if (crossed.length > 0) {
+        const highestCrossed = Math.max(...crossed);
+        await env.WATCHER_STATE.put(kvKey, String(highestCrossed));
+        const message =
+          `⭐ <b>Star Milestone!</b>\n` +
+          `<b>${escapeHTML(repo)}</b>\n` +
+          `Reached <b>${currentStars}</b> stars!\n` +
+          `Milestone: ${crossed.map(m => m.toLocaleString()).join(', ')}\n` +
+          `<a href="https://github.com/${repo}">View on GitHub →</a>`;
+        await sendNotification(message, config, 'high');
+        await addHistoryEntry({ type: "star_milestone", repo, stars: currentStars, milestones: crossed, priority: 'high' }, env);
+        sent++;
+      }
     }
 
-    if (currentForks <= lastForks) return 0;
+    // Fork monitoring
+    if (needForks) {
+      const currentForks = repoData.forks_count;
+      const kvKey = `fork:${repo}`;
+      const lastForksStr = await env.WATCHER_STATE.get(kvKey);
+      if (lastForksStr === null) {
+        await env.WATCHER_STATE.put(kvKey, String(currentForks));
+      } else {
+        const lastForks = parseInt(lastForksStr, 10);
+        if (currentForks > lastForks) {
+          await env.WATCHER_STATE.put(kvKey, String(currentForks));
+          const diff = currentForks - lastForks;
+          const message =
+            `🍴 <b>New Fork${diff > 1 ? 's' : ''}</b>\n` +
+            `<b>${escapeHTML(repo)}</b>\n` +
+            `Forks: ${lastForks} → <b>${currentForks}</b> (+${diff})\n` +
+            `<a href="https://github.com/${repo}/network/members">View Forks →</a>`;
+          await sendNotification(message, config);
+          await addHistoryEntry({ type: "fork", repo, forks: currentForks, diff }, env);
+          sent++;
+        }
+      }
+    }
 
-    await env.WATCHER_STATE.put(kvKey, String(currentForks));
-    const diff = currentForks - lastForks;
-
-    const message =
-      `🍴 <b>New Fork${diff > 1 ? 's' : ''}</b>\n` +
-      `<b>${escapeHTML(repo)}</b>\n` +
-      `Forks: ${lastForks} → <b>${currentForks}</b> (+${diff})\n` +
-      `<a href="https://github.com/${repo}/network/members">View Forks →</a>`;
-
-    await sendNotification(message, config);
-    await addHistoryEntry({ type: "fork", repo, forks: currentForks, diff }, env);
-    return 1;
+    return sent;
   } catch (e) {
     return 0;
   }
@@ -1151,6 +1182,10 @@ function generateRSS(history, baseUrl) {
                   h.type === 'action' ? `${h.repo} Actions: ${h.name}` :
                   h.type === 'issue' ? `${h.repo} Issue #${h.number}: ${h.title}` :
                   h.type === 'pr' ? `${h.repo} PR #${h.number}: ${h.title}` :
+                  h.type === 'pr_merge' ? `${h.repo} PR Merged #${h.number}: ${h.title}` :
+                  h.type === 'star_milestone' ? `${h.repo} ⭐ ${h.stars} Stars!` :
+                  h.type === 'fork' ? `${h.repo} New Fork (+${h.diff})` :
+                  h.type === 'keyword' ? `${h.repo} Keyword Alert: ${h.keyword}` :
                   `${h.repo} Update`;
     const link = h.url || h.diff_url || `${baseUrl}`;
     const pubDate = new Date(h.timestamp).toUTCString();
@@ -1876,7 +1911,7 @@ function getHTML() {
       </div>
     </details>
 
-    <!-- 9. Repo Comparison -->
+    <!-- 8. Repo Comparison -->
     <details>
       <summary><h2>📊 仓库对比</h2></summary>
       <div class="card-inner">
@@ -1884,7 +1919,7 @@ function getHTML() {
       </div>
     </details>
 
-    <!-- 10. Weekly Summary -->
+    <!-- 9. Weekly Summary -->
     <details>
       <summary><h2>📋 周报摘要</h2></summary>
       <div class="card-inner">
@@ -1892,7 +1927,7 @@ function getHTML() {
       </div>
     </details>
 
-    <!-- 11. History -->
+    <!-- 10. History -->
     <details>
       <summary>
         <h2>📜 通知历史</h2>
