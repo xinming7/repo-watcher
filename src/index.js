@@ -123,6 +123,12 @@ export default {
       if (path === "/api/repos/activity" && method === "GET") {
         return jsonResponse(await getReposActivity(config, env), corsHeaders);
       }
+      if (path === "/api/summary" && method === "GET") {
+        return jsonResponse(await getWeeklySummary(config, env), corsHeaders);
+      }
+      if (path === "/api/repos/compare" && method === "GET") {
+        return jsonResponse(await getReposComparison(config, env), corsHeaders);
+      }
       if (path === "/api/quota" && method === "GET") {
         try {
           const rateLimit = await githubAPI('/rate_limit', config);
@@ -167,7 +173,7 @@ export default {
 
 async function getConfig(env) {
   const config = await env.WATCHER_STATE.get("config", { type: "json" });
-  if (!config) return { telegramBotToken: "", telegramChatId: "", watchRepos: [], authPassword: "", filters: {}, keywordAlerts: [] };
+  if (!config) return { telegramBotToken: "", telegramChatId: "", watchRepos: [], authPassword: "", filters: {}, keywordAlerts: [], notifySlack: "", notificationPriority: "normal", starMilestones: [100, 500, 1000], weeklySummary: false };
   // Migrate old string format to object format
   if (config.watchRepos && config.watchRepos.length > 0 && typeof config.watchRepos[0] === "string") {
     config.watchRepos = config.watchRepos.map(r => ({
@@ -194,6 +200,14 @@ async function saveConfig(body, env, existingConfig) {
     filters: body.filters !== undefined ? body.filters : (existing.filters || {}),
     // Keyword alerts
     keywordAlerts: body.keywordAlerts !== undefined ? body.keywordAlerts : (existing.keywordAlerts || []),
+    // Notification channels
+    notifySlack: body.notifySlack !== undefined ? body.notifySlack : (existing.notifySlack || ""),
+    // Notification priority
+    notificationPriority: body.notificationPriority !== undefined ? body.notificationPriority : (existing.notificationPriority || "normal"),
+    // Star milestones
+    starMilestones: body.starMilestones !== undefined ? body.starMilestones : (existing.starMilestones || [100, 500, 1000]),
+    // Weekly summary
+    weeklySummary: body.weeklySummary !== undefined ? body.weeklySummary : (existing.weeklySummary || false),
     updatedAt: new Date().toISOString(),
   };
   await env.WATCHER_STATE.put("config", JSON.stringify(config));
@@ -213,13 +227,15 @@ async function getRepos(env, existingConfig) {
 }
 
 function normalizeWatch(w) {
-  if (!w) return { releases: true, commits: true, actions: false, issues: false, prs: false };
+  if (!w) return { releases: true, commits: true, actions: false, issues: false, prs: false, forks: false, prReviews: false };
   return {
     releases: w.releases !== undefined ? w.releases : true,
     commits: w.commits !== undefined ? w.commits : true,
     actions: w.actions !== undefined ? w.actions : false,
     issues: w.issues !== undefined ? w.issues : false,
     prs: w.prs !== undefined ? w.prs : false,
+    forks: w.forks !== undefined ? w.forks : false,
+    prReviews: w.prReviews !== undefined ? w.prReviews : false,
   };
 }
 
@@ -298,6 +314,7 @@ async function addHistoryEntry(entry, env) {
   history.unshift({
     ...entry,
     timestamp: new Date().toISOString(),
+    priority: entry.priority || 'normal',
   });
   // Keep only last 200 entries
   await env.WATCHER_STATE.put("history", JSON.stringify(history.slice(0, 200)));
@@ -326,6 +343,7 @@ async function getStatus(env, existingConfig) {
   const channels = [];
   if (config.telegramBotToken && config.telegramChatId) channels.push('Telegram');
   if (config.notifyDiscord) channels.push('Discord');
+  if (config.notifySlack) channels.push('Slack');
   if (config.notifyWebhook) channels.push('Webhook');
 
   return {
@@ -355,6 +373,10 @@ function maskConfigTokens(config) {
     notifyWebhook: config.notifyWebhook || "",
     filters: config.filters || {},
     keywordAlerts: config.keywordAlerts || [],
+    notifySlack: config.notifySlack || "",
+    notificationPriority: config.notificationPriority || "normal",
+    starMilestones: config.starMilestones || [100, 500, 1000],
+    weeklySummary: config.weeklySummary || false,
     updatedAt: config.updatedAt,
   };
 }
@@ -538,7 +560,10 @@ async function checkRepo(repo, watch, config, env) {
   if (watch.actions) sent += await checkActions(repo, config, env, filters);
   if (watch.issues) sent += await checkIssues(repo, config, env, filters);
   if (watch.prs) sent += await checkPRs(repo, config, env, filters);
+  if (watch.forks) sent += await checkForks(repo, config, env);
+  if (watch.prReviews) sent += await checkPRMerges(repo, config, env);
   sent += await checkKeywordAlerts(repo, config, env);
+  sent += await checkStarMilestones(repo, config, env);
   return sent;
 }
 
@@ -843,6 +868,165 @@ async function checkKeywordAlerts(repo, config, env) {
   return sent;
 }
 
+
+// ── Star Milestones ──
+
+async function checkStarMilestones(repo, config, env) {
+  const milestones = config.starMilestones || [];
+  if (milestones.length === 0) return 0;
+
+  try {
+    const repoData = await githubAPI(`/repos/${repo}`, config);
+    const currentStars = repoData.stargazers_count;
+    const kvKey = `starMilestone:${repo}`;
+    const lastNotified = parseInt(await env.WATCHER_STATE.get(kvKey) || "0", 10);
+
+    // Find the highest milestone that has been crossed
+    const crossed = milestones.filter(m => currentStars >= m && m > lastNotified);
+    if (crossed.length === 0) return 0;
+
+    const highestCrossed = Math.max(...crossed);
+    await env.WATCHER_STATE.put(kvKey, String(highestCrossed));
+
+    const message =
+      `⭐ <b>Star Milestone!</b>\n` +
+      `<b>${escapeHTML(repo)}</b>\n` +
+      `Reached <b>${currentStars}</b> stars!\n` +
+      `Milestone: ${crossed.map(m => m.toLocaleString()).join(', ')}\n` +
+      `<a href="https://github.com/${repo}">View on GitHub →</a>`;
+
+    await sendNotification(message, config, 'high');
+    await addHistoryEntry({ type: "star_milestone", repo, stars: currentStars, milestones: crossed, priority: 'high' }, env);
+    return 1;
+  } catch (e) {
+    return 0;
+  }
+}
+
+// ── Fork Monitoring ──
+
+async function checkForks(repo, config, env) {
+  try {
+    const repoData = await githubAPI(`/repos/${repo}`, config);
+    const currentForks = repoData.forks_count;
+    const kvKey = `fork:${repo}`;
+    const lastForks = parseInt(await env.WATCHER_STATE.get(kvKey) || String(currentForks), 10);
+
+    if (!await env.WATCHER_STATE.get(kvKey)) {
+      await env.WATCHER_STATE.put(kvKey, String(currentForks));
+      return 0;
+    }
+
+    if (currentForks <= lastForks) return 0;
+
+    await env.WATCHER_STATE.put(kvKey, String(currentForks));
+    const diff = currentForks - lastForks;
+
+    const message =
+      `🍴 <b>New Fork${diff > 1 ? 's' : ''}</b>\n` +
+      `<b>${escapeHTML(repo)}</b>\n` +
+      `Forks: ${lastForks} → <b>${currentForks}</b> (+${diff})\n` +
+      `<a href="https://github.com/${repo}/network/members">View Forks →</a>`;
+
+    await sendNotification(message, config);
+    await addHistoryEntry({ type: "fork", repo, forks: currentForks, diff }, env);
+    return 1;
+  } catch (e) {
+    return 0;
+  }
+}
+
+// ── PR Merge / Review Monitoring ──
+
+async function checkPRMerges(repo, config, env) {
+  try {
+    const data = await githubAPI(`/repos/${repo}/pulls?state=closed&sort=updated&direction=desc&per_page=5`, config);
+    if (!data || !Array.isArray(data) || data.length === 0) return 0;
+
+    const kvKey = `prMerge:${repo}`;
+    const lastId = await env.WATCHER_STATE.get(kvKey);
+
+    if (!lastId) {
+      await env.WATCHER_STATE.put(kvKey, String(data[0].id));
+      return 0;
+    }
+
+    const lastIdNum = parseInt(lastId, 10);
+    const merged = data.filter(p => p.id > lastIdNum && p.merged_at);
+    if (merged.length === 0) return 0;
+
+    await env.WATCHER_STATE.put(kvKey, String(data[0].id));
+
+    for (const pr of merged.reverse()) {
+      const message =
+        `✅ <b>PR Merged</b>\n` +
+        `<b>${escapeHTML(repo)}</b>\n` +
+        `#${pr.number} ${escapeHTML(pr.title || "untitled")}\n` +
+        `By ${escapeHTML(pr.user?.login || "unknown")}\n` +
+        `<a href="${pr.html_url}">View on GitHub →</a>`;
+
+      await sendNotification(message, config);
+      await addHistoryEntry({ type: "pr_merge", repo, number: pr.number, title: pr.title, url: pr.html_url }, env);
+    }
+
+    return merged.length;
+  } catch (e) {
+    return 0;
+  }
+}
+
+// ── Weekly Summary ──
+
+async function getWeeklySummary(config, env) {
+  const history = (await env.WATCHER_STATE.get("history", { type: "json" })) || [];
+  const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const weekHistory = history.filter(h => new Date(h.timestamp).getTime() > weekAgo);
+
+  const summary = {};
+  for (const h of weekHistory) {
+    if (!summary[h.repo]) summary[h.repo] = { releases: 0, commits: 0, actions: 0, issues: 0, prs: 0, prMerges: 0, forks: 0, starMilestones: 0, keywordAlerts: 0 };
+    const s = summary[h.repo];
+    if (h.type === 'release') s.releases++;
+    else if (h.type === 'commit' || h.type === 'commits') s.commits += h.count || 1;
+    else if (h.type === 'action') s.actions++;
+    else if (h.type === 'issue') s.issues++;
+    else if (h.type === 'pr') s.prs++;
+    else if (h.type === 'pr_merge') s.prMerges++;
+    else if (h.type === 'fork') s.forks++;
+    else if (h.type === 'star_milestone') s.starMilestones++;
+    else if (h.type === 'keyword') s.keywordAlerts++;
+  }
+
+  return { summary, totalEvents: weekHistory.length, period: '7d' };
+}
+
+// ── Repos Comparison ──
+
+async function getReposComparison(config, env) {
+  const repos = config.watchRepos || [];
+  if (repos.length === 0) return { repos: [] };
+
+  const results = [];
+  for (const entry of repos.slice(0, 20)) {
+    const repoName = typeof entry === "string" ? entry : entry.repo;
+    try {
+      const data = await githubAPI(`/repos/${repoName}`, config);
+      results.push({
+        repo: repoName,
+        stars: data.stargazers_count,
+        forks: data.forks_count,
+        openIssues: data.open_issues_count,
+        watchers: data.subscribers_count,
+        language: data.language,
+        updatedAt: data.updated_at,
+        createdAt: data.created_at,
+      });
+    } catch (e) { /* skip */ }
+  }
+
+  return { repos: results };
+}
+
 // ── GitHub API helper ──
 
 async function githubAPI(path, config) {
@@ -890,26 +1074,39 @@ async function reportToUpdateHub(env, { version, title, body, status, diff_url, 
 
 // ── Multi-channel notification ──
 
-async function sendNotification(text, config) {
+async function sendNotification(text, config, priority) {
+  const p = priority || config.notificationPriority || 'normal';
+  const prefix = p === 'high' ? '🔴 ' : '';
+  const fullText = prefix + text;
   // Always try Telegram
-  await sendTelegram(text, config);
+  await sendTelegram(fullText, config);
   // Discord webhook
   if (config.notifyDiscord) {
     try {
       await fetch(config.notifyDiscord, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content: text.replace(/<[^>]*>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>') }),
+        body: JSON.stringify({ content: fullText.replace(/<[^>]*>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>') }),
       });
     } catch (e) { console.error('Discord notify failed:', e.message); }
   }
+  // Slack webhook
+  if (config.notifySlack && config.notifySlack.startsWith('https://')) {
+    try {
+      await fetch(config.notifySlack, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: fullText.replace(/<[^>]*>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>') }),
+      });
+    } catch (e) { console.error('Slack notify failed:', e.message); }
+  }
   // Generic webhook
-  if (config.notifyWebhook) {
+  if (config.notifyWebhook && config.notifyWebhook.startsWith('https://')) {
     try {
       await fetch(config.notifyWebhook, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, raw: text.replace(/<[^>]*>/g, '') }),
+        body: JSON.stringify({ text: fullText, raw: fullText.replace(/<[^>]*>/g, ''), priority: p }),
       });
     } catch (e) { console.error('Webhook notify failed:', e.message); }
   }
@@ -1300,6 +1497,24 @@ function getHTML() {
     .channel-badge.tg { background: rgba(0,136,204,0.2); color: #0088cc; }
     .channel-badge.dc { background: rgba(88,101,242,0.2); color: #5865f2; }
     .channel-badge.wh { background: rgba(255,149,0,0.2); color: #ff9500; }
+    .channel-badge.sl { background: rgba(74,21,75,0.2); color: #e01e5a; }
+    .history-item.star_milestone { border-color: #ffd700; }
+    .history-item.fork { border-color: #00aa55; }
+    .history-item.pr_merge { border-color: #00d9ff; }
+    .compare-table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }
+    .compare-table th { text-align: left; padding: 10px 12px; border-bottom: 2px solid var(--card-border); color: var(--accent); font-weight: 600; }
+    .compare-table td { padding: 10px 12px; border-bottom: 1px solid var(--card-border-light); color: var(--text-primary); }
+    .compare-table tr:hover td { background: var(--input-focus-bg); }
+    .compare-table a { color: var(--link-color); text-decoration: none; }
+    .compare-table a:hover { text-decoration: underline; }
+    .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 12px; }
+    .summary-card { background: var(--card-bg); border-radius: 10px; padding: 16px; border: 1px solid var(--card-border-light); }
+    .summary-card h3 { font-size: 14px; color: var(--accent); margin-bottom: 10px; }
+    .summary-stat { display: flex; justify-content: space-between; padding: 4px 0; font-size: 13px; }
+    .summary-stat .label { color: var(--text-muted); }
+    .summary-stat .value { font-weight: 600; color: var(--text-primary); }
+    .priority-badge { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 10px; font-weight: 700; margin-left: 6px; }
+    .priority-badge.high { background: rgba(255,59,48,0.2); color: #ff3b30; }
     .history-meta {
       color: var(--text-dim);
       font-size: 12px;
@@ -1479,6 +1694,8 @@ function getHTML() {
           <label><input type="checkbox" id="opt-actions"> ⚡ Actions</label>
           <label><input type="checkbox" id="opt-issues"> 🆕 Issue</label>
           <label><input type="checkbox" id="opt-prs"> 🔀 PR</label>
+          <label><input type="checkbox" id="opt-forks"> 🍴 Fork</label>
+          <label><input type="checkbox" id="opt-pr-reviews"> ✅ PR Merge</label>
           <button class="btn btn-secondary btn-sm" id="btn-import-stars" onclick="showStarredModal()" style="margin-left:auto">⭐ 从 Star 导入</button>
         </div>
       </div>
@@ -1538,6 +1755,10 @@ function getHTML() {
         <div class="form-group">
           <label>Discord Webhook URL（可选）</label>
           <input type="text" id="discord-webhook" placeholder="https://discord.com/api/webhooks/...">
+        </div>
+        <div class="form-group">
+          <label>Slack Webhook URL（可选）</label>
+          <input type="text" id="slack-webhook" placeholder="https://hooks.slack.com/services/...">
         </div>
         <div class="form-group">
           <label>自定义 Webhook URL（可选）</label>
@@ -1605,7 +1826,35 @@ function getHTML() {
       </div>
     </details>
 
-    <!-- 6. Keyword Alerts -->
+    <!-- 6. Notification Settings -->
+    <details>
+      <summary><h2>⚙️ 通知设置</h2></summary>
+      <div class="card-inner">
+        <div class="filter-row">
+          <div class="form-group">
+            <label>默认通知优先级</label>
+            <select id="notification-priority" style="width:100%;padding:12px 16px;background:var(--input-bg);border:1px solid var(--input-border);border-radius:10px;color:var(--text-primary);font-size:14px">
+              <option value="normal">普通</option>
+              <option value="high">高优先级（通知带 🔴 标记）</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Star 里程碑（逗号分隔）</label>
+            <input type="text" id="star-milestones" placeholder="如 100,500,1000">
+            <div class="token-hint">达到这些 Star 数时发送通知</div>
+          </div>
+        </div>
+        <div class="filter-row">
+          <div class="form-group">
+            <label>周报摘要</label>
+            <label style="font-weight:normal"><input type="checkbox" id="weekly-summary"> 启用每周摘要汇总</label>
+          </div>
+        </div>
+        <button class="btn btn-primary" id="btn-save-notify-settings" onclick="saveNotifySettings()">💾 保存通知设置</button>
+      </div>
+    </details>
+
+    <!-- 7. Keyword Alerts -->
     <details>
       <summary><h2>🔔 关键词告警</h2></summary>
       <div class="card-inner">
@@ -1627,7 +1876,23 @@ function getHTML() {
       </div>
     </details>
 
-    <!-- 8. History -->
+    <!-- 9. Repo Comparison -->
+    <details>
+      <summary><h2>📊 仓库对比</h2></summary>
+      <div class="card-inner">
+        <div id="compare-table"><div class="empty-state">加载中...</div></div>
+      </div>
+    </details>
+
+    <!-- 10. Weekly Summary -->
+    <details>
+      <summary><h2>📋 周报摘要</h2></summary>
+      <div class="card-inner">
+        <div id="summary-content"><div class="empty-state">加载中...</div></div>
+      </div>
+    </details>
+
+    <!-- 11. History -->
     <details>
       <summary>
         <h2>📜 通知历史</h2>
@@ -1818,7 +2083,7 @@ function getHTML() {
       const ch = status.channels || [];
       if (ch.length > 0) {
         document.getElementById('notify-channels').innerHTML = '通知渠道: ' + ch.map(c =>
-          '<span class="channel-badge ' + (c === 'Telegram' ? 'tg' : c === 'Discord' ? 'dc' : 'wh') + '">' + c + '</span>'
+          '<span class="channel-badge ' + (c === 'Telegram' ? 'tg' : c === 'Discord' ? 'dc' : c === 'Slack' ? 'sl' : 'wh') + '">' + c + '</span>'
         ).join('');
       }
     }
@@ -1847,6 +2112,12 @@ function getHTML() {
       document.getElementById('filter-commit-keyword').value = f.commitKeyword || '';
       // Keyword alerts
       renderKeywordAlerts(config.keywordAlerts || []);
+      // Slack
+      document.getElementById('slack-webhook').value = config.notifySlack || '';
+      // Notification settings
+      document.getElementById('notification-priority').value = config.notificationPriority || 'normal';
+      document.getElementById('star-milestones').value = (config.starMilestones || [100, 500, 1000]).join(',');
+      document.getElementById('weekly-summary').checked = !!config.weeklySummary;
     }
 
     async function saveConfig() {
@@ -1858,6 +2129,7 @@ function getHTML() {
           telegramChatId: document.getElementById('telegram-chat-id').value.trim(),
           githubToken: ghVal,
           notifyDiscord: document.getElementById('discord-webhook').value.trim(),
+          notifySlack: document.getElementById('slack-webhook').value.trim(),
           notifyWebhook: document.getElementById('custom-webhook').value.trim(),
         };
         if (tokenVal || document.getElementById('telegram-token').dataset.hasValue === '1') {
@@ -1964,6 +2236,8 @@ function getHTML() {
               mkBtn('actions', '⚡ Actions') +
               mkBtn('issues', '🆕 Issue') +
               mkBtn('prs', '🔀 PR') +
+              mkBtn('forks', '🍴 Fork') +
+              mkBtn('prReviews', '✅ PR Merge') +
             '</span>' +
             '<button class="btn btn-danger btn-sm" data-remove="' + safe + '">删除</button>' +
           '</div>' +
@@ -2001,6 +2275,8 @@ function getHTML() {
         actions: document.getElementById('opt-actions').checked,
         issues: document.getElementById('opt-issues').checked,
         prs: document.getElementById('opt-prs').checked,
+        forks: document.getElementById('opt-forks').checked,
+        prReviews: document.getElementById('opt-pr-reviews').checked,
       };
       setBtnLoading('btn-add-repo', true);
       try {
@@ -2064,6 +2340,13 @@ function getHTML() {
           content = '🔀 <b>New PR</b> ' + repo + ' #' + escapeHTML(String(h.number || '')) + ' ' + escapeHTML(h.title || '');
         } else if (h.type === 'keyword') {
           content = '🔔 <b>关键词告警</b> ' + repo + ' <code>' + escapeHTML(h.keyword || '') + '</code> ' + escapeHTML(h.sha || '');
+        } else if (h.type === 'star_milestone') {
+          const ms = (h.milestones || []).map(m => m.toLocaleString()).join(', ');
+          content = '⭐ <b>Star 里程碑</b> ' + repo + ' ' + escapeHTML(String(h.stars || '')) + ' ⭐ (' + escapeHTML(ms) + ')';
+        } else if (h.type === 'fork') {
+          content = '🍴 <b>Fork 变更</b> ' + repo + ' ' + escapeHTML(String(h.forks || '')) + ' (+' + escapeHTML(String(h.diff || '')) + ')';
+        } else if (h.type === 'pr_merge') {
+          content = '✅ <b>PR 已合并</b> ' + repo + ' #' + escapeHTML(String(h.number || '')) + ' ' + escapeHTML(h.title || '');
         } else if (h.type === 'error') {
           content = '❌ <b>错误</b> ' + repo + ': ' + msg;
         }
@@ -2183,6 +2466,8 @@ function getHTML() {
         actions: document.getElementById('opt-actions').checked,
         issues: document.getElementById('opt-issues').checked,
         prs: document.getElementById('opt-prs').checked,
+        forks: document.getElementById('opt-forks').checked,
+        prReviews: document.getElementById('opt-pr-reviews').checked,
       };
       setBtnLoading('btn-add-starred', true);
       let added = 0;
@@ -2290,9 +2575,86 @@ function getHTML() {
       }
     }
 
+
+    // Notification settings save
+    async function saveNotifySettings() {
+      setBtnLoading('btn-save-notify-settings', true);
+      try {
+        const milestonesStr = document.getElementById('star-milestones').value.trim();
+        const milestones = milestonesStr ? milestonesStr.split(',').map(s => parseInt(s.trim(), 10)).filter(n => n > 0) : [];
+        const body = {
+          notificationPriority: document.getElementById('notification-priority').value,
+          starMilestones: milestones,
+          weeklySummary: document.getElementById('weekly-summary').checked,
+        };
+        await fetchAPI('/api/config', { method: 'POST', body: JSON.stringify(body) });
+        showToast('通知设置已保存');
+      } catch (e) {
+        showToast('保存失败: ' + e.message, 'error');
+      } finally {
+        setBtnLoading('btn-save-notify-settings', false);
+      }
+    }
+
+    // Repos comparison
+    async function loadCompare() {
+      try {
+        const { repos } = await fetchAPI('/api/repos/compare');
+        const container = document.getElementById('compare-table');
+        if (!repos || repos.length === 0) {
+          container.innerHTML = '<div class="empty-state">暂无监控仓库</div>';
+          return;
+        }
+        container.innerHTML = '<table class="compare-table"><thead><tr>' +
+          '<th>仓库</th><th>⭐ Stars</th><th>🍴 Forks</th><th>📋 Issues</th><th>👁 Watchers</th><th>🔤 语言</th>' +
+          '</tr></thead><tbody>' +
+          repos.map(r =>
+            '<tr><td><a href="https://github.com/' + escapeHTML(r.repo) + '" target="_blank">' + escapeHTML(r.repo) + '</a></td>' +
+            '<td>' + r.stars.toLocaleString() + '</td>' +
+            '<td>' + r.forks.toLocaleString() + '</td>' +
+            '<td>' + r.openIssues.toLocaleString() + '</td>' +
+            '<td>' + r.watchers.toLocaleString() + '</td>' +
+            '<td>' + escapeHTML(r.language || '-') + '</td></tr>'
+          ).join('') + '</tbody></table>';
+      } catch (e) {
+        document.getElementById('compare-table').innerHTML = '<div class="empty-state">加载失败</div>';
+      }
+    }
+
+    // Weekly summary
+    async function loadSummary() {
+      try {
+        const data = await fetchAPI('/api/summary');
+        const container = document.getElementById('summary-content');
+        const repos = Object.keys(data.summary);
+        if (repos.length === 0) {
+          container.innerHTML = '<div class="empty-state">本周暂无活动记录</div>';
+          return;
+        }
+        container.innerHTML = '<p style="color:var(--text-muted);font-size:13px;margin-bottom:12px">本周共 ' + data.totalEvents + ' 条事件</p>' +
+          '<div class="summary-grid">' + repos.map(repo => {
+            const s = data.summary[repo];
+            const items = [];
+            if (s.releases) items.push(['🏷️ Releases', s.releases]);
+            if (s.commits) items.push(['📝 Commits', s.commits]);
+            if (s.actions) items.push(['⚡ Actions', s.actions]);
+            if (s.issues) items.push(['🆕 Issues', s.issues]);
+            if (s.prs) items.push(['🔀 PRs', s.prs]);
+            if (s.prMerges) items.push(['✅ Merges', s.prMerges]);
+            if (s.forks) items.push(['🍴 Forks', s.forks]);
+            if (s.starMilestones) items.push(['⭐ Star 里程碑', s.starMilestones]);
+            if (s.keywordAlerts) items.push(['🔔 关键词告警', s.keywordAlerts]);
+            return '<div class="summary-card"><h3>' + escapeHTML(repo) + '</h3>' +
+              items.map(([l, v]) => '<div class="summary-stat"><span class="label">' + l + '</span><span class="value">' + v + '</span></div>').join('') +
+              '</div>';
+          }).join('') + '</div>';
+      } catch (e) {
+        document.getElementById('summary-content').innerHTML = '<div class="empty-state">加载失败</div>';
+      }
+    }
     // Init
     async function initApp() {
-      await Promise.all([loadStatus(), loadConfig(), loadRepos(), loadHistory(), loadStars()]);
+      await Promise.all([loadStatus(), loadConfig(), loadRepos(), loadHistory(), loadStars(), loadCompare(), loadSummary()]);
     }
 
     (async function init() {
