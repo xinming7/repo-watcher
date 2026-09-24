@@ -1541,12 +1541,9 @@ function getHTML() {
       background: var(--accent-gradient);
       -webkit-background-clip: text;
       -webkit-text-fill-color: transparent;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
+      word-break: break-all;
       max-width: 100%;
     }
-    .stat-value.small { font-size: 1.1em; }
     .stat-label {
       color: var(--text-muted);
       margin-top: 8px;
@@ -2177,12 +2174,9 @@ function getHTML() {
       document.getElementById('stat-repos').textContent = status.reposCount;
       document.getElementById('stat-notifications').textContent = status.notificationsSent;
       document.getElementById('stat-telegram').textContent = status.telegramConfigured ? '✅ 已配置' : '❌ 未配置';
-      const lastCheckEl = document.getElementById('stat-last-check');
-      const lastCheckText = status.lastCheck
+      document.getElementById('stat-last-check').textContent = status.lastCheck
         ? new Date(status.lastCheck).toLocaleString('zh-CN')
         : '从未';
-      lastCheckEl.textContent = lastCheckText;
-      lastCheckEl.className = 'stat-value' + (lastCheckText.length > 12 ? ' small' : '');
       document.getElementById('stat-cron').textContent = status.cronSchedule || '*/30 * * * *';
       // API Quota
       if (status.apiQuota) {
@@ -2835,7 +2829,6 @@ function getHTML() {
         const milestonesStr = document.getElementById('star-milestones').value.trim();
         const milestones = milestonesStr ? milestonesStr.split(',').map(s => parseInt(s.trim(), 10)).filter(n => n > 0) : [];
         const body = {
-          notificationPriority: document.getElementById('notification-priority').value,
           starMilestones: milestones,
           weeklySummary: document.getElementById('weekly-summary').checked,
         };
