@@ -235,7 +235,6 @@ function normalizeWatch(w) {
     prs: w.prs !== undefined ? w.prs : false,
     forks: w.forks !== undefined ? w.forks : false,
     prReviews: w.prReviews !== undefined ? w.prReviews : false,
-    priority: w.priority || 'normal',
   };
 }
 
@@ -593,19 +592,18 @@ async function checkAllRepos(env) {
 async function checkRepo(repo, watch, config, env) {
   let sent = 0;
   const filters = config.filters || {};
-  const repoPriority = watch.priority || 'normal';
-  if (watch.releases) sent += await checkReleases(repo, config, env, filters, repoPriority);
-  if (watch.commits) sent += await checkCommits(repo, config, env, filters, repoPriority);
-  if (watch.actions) sent += await checkActions(repo, config, env, filters, repoPriority);
-  if (watch.issues) sent += await checkIssues(repo, config, env, filters, repoPriority);
-  if (watch.prs) sent += await checkPRs(repo, config, env, filters, repoPriority);
+  if (watch.releases) sent += await checkReleases(repo, config, env, filters);
+  if (watch.commits) sent += await checkCommits(repo, config, env, filters);
+  if (watch.actions) sent += await checkActions(repo, config, env, filters);
+  if (watch.issues) sent += await checkIssues(repo, config, env, filters);
+  if (watch.prs) sent += await checkPRs(repo, config, env, filters);
   sent += await checkRepoMeta(repo, watch, config, env);
   if (watch.prReviews) sent += await checkPRMerges(repo, config, env);
   sent += await checkKeywordAlerts(repo, config, env);
   return sent;
 }
 
-async function checkReleases(repo, config, env, filters, repoPriority) {
+async function checkReleases(repo, config, env, filters) {
   const data = await githubAPI(`/repos/${repo}/releases?per_page=5`, config);
   if (!data || !Array.isArray(data) || data.length === 0) return 0;
 
@@ -643,7 +641,7 @@ async function checkReleases(repo, config, env, filters, repoPriority) {
     if (filters.ignorePreRelease && release.prerelease) continue;
     // Filter: tag keyword
     if (filters.tagKeyword && !tag.toLowerCase().includes(filters.tagKeyword.toLowerCase())) continue;
-    await sendNotification(message, config, repoPriority);
+    await sendNotification(message, config);
     await addHistoryEntry({ type: "release", repo, tag, name, url }, env);
     await reportToUpdateHub(env, {
       version: tag,
@@ -658,7 +656,7 @@ async function checkReleases(repo, config, env, filters, repoPriority) {
   return newReleases.length;
 }
 
-async function checkCommits(repo, config, env, filters, repoPriority) {
+async function checkCommits(repo, config, env, filters) {
   const data = await githubAPI(`/repos/${repo}/commits?per_page=10`, config);
   if (!data || !Array.isArray(data) || data.length === 0) return 0;
 
@@ -698,7 +696,7 @@ async function checkCommits(repo, config, env, filters, repoPriority) {
     if (filters.ignoreAuthors && filters.ignoreAuthors.some(a => author.toLowerCase().includes(a.toLowerCase()))) { return 0; }
     // Filter: commit keyword
     if (filters.commitKeyword && !msg.toLowerCase().includes(filters.commitKeyword.toLowerCase())) { return 0; }
-    await sendNotification(message, config, repoPriority);
+    await sendNotification(message, config);
     await addHistoryEntry({ type: "commit", repo, sha: shortSha, message: msg, author }, env);
     await reportToUpdateHub(env, {
       title: `${repo} Commit: ${shortSha}`,
@@ -724,7 +722,7 @@ async function checkCommits(repo, config, env, filters, repoPriority) {
       `<b>${escapeHTML(repo)}</b>\n${lines}\n` +
       `<a href="${compareUrl}">View changes →</a>`;
 
-    await sendNotification(message, config, repoPriority);
+    await sendNotification(message, config);
     await addHistoryEntry({ type: "commits", repo, count: newCommits.length }, env);
     await reportToUpdateHub(env, {
       title: `${repo} ${newCommits.length} new commit(s)`,
@@ -738,7 +736,7 @@ async function checkCommits(repo, config, env, filters, repoPriority) {
   return newCommits.length;
 }
 
-async function checkActions(repo, config, env, filters, repoPriority) {
+async function checkActions(repo, config, env, filters) {
   const data = await githubAPI(`/repos/${repo}/actions/runs?per_page=5&status=completed`, config);
   if (!data || !data.workflow_runs || data.workflow_runs.length === 0) return 0;
 
@@ -772,7 +770,7 @@ async function checkActions(repo, config, env, filters, repoPriority) {
 
     // Filter: only failures
     if (filters.actionsOnlyFailures && run.conclusion === 'success') continue;
-    await sendNotification(message, config, repoPriority);
+    await sendNotification(message, config);
     await addHistoryEntry({ type: "action", repo, name, conclusion: run.conclusion, url: run.html_url }, env);
     await reportToUpdateHub(env, {
       title: `${repo} Actions: ${name}`,
@@ -788,7 +786,7 @@ async function checkActions(repo, config, env, filters, repoPriority) {
 
 
 
-async function checkIssues(repo, config, env, filters, repoPriority) {
+async function checkIssues(repo, config, env, filters) {
   const data = await githubAPI(`/repos/${repo}/issues?state=open&sort=created&direction=desc&per_page=5`, config);
   if (!data || !Array.isArray(data) || data.length === 0) return 0;
 
@@ -818,14 +816,14 @@ async function checkIssues(repo, config, env, filters, repoPriority) {
       `By ${escapeHTML(issue.user?.login || "unknown")}\n` +
       `<a href="${issue.html_url}">View on GitHub →</a>`;
 
-    await sendNotification(message, config, repoPriority);
+    await sendNotification(message, config);
     await addHistoryEntry({ type: "issue", repo, number: issue.number, title, url: issue.html_url }, env);
   }
 
   return newIssues.length;
 }
 
-async function checkPRs(repo, config, env, filters, repoPriority) {
+async function checkPRs(repo, config, env, filters) {
   const data = await githubAPI(`/repos/${repo}/pulls?state=open&sort=created&direction=desc&per_page=5`, config);
   if (!data || !Array.isArray(data) || data.length === 0) return 0;
 
@@ -852,7 +850,7 @@ async function checkPRs(repo, config, env, filters, repoPriority) {
       `By ${escapeHTML(pr.user?.login || "unknown")}\n` +
       `<a href="${pr.html_url}">View on GitHub →</a>`;
 
-    await sendNotification(message, config, repoPriority);
+    await sendNotification(message, config);
     await addHistoryEntry({ type: "pr", repo, number: pr.number, title, url: pr.html_url }, env);
   }
 
@@ -1468,8 +1466,6 @@ function getHTML() {
     .repo-list {
       list-style: none;
     }
-    .priority-select { padding: 2px 6px; border-radius: 6px; font-size: 11px; border: 1px solid var(--toggle-border); background: var(--toggle-bg); color: var(--text-dim); cursor: pointer; }
-    .priority-select.high { border-color: #ff3b30; color: #ff3b30; background: rgba(255,59,48,0.1); }
     .repo-item.pinned { border-color: var(--accent); background: var(--toggle-on-bg); }
     .repo-item.pinned .repo-name a { font-weight: 700; }
     .pin-btn { background: none; border: none; cursor: pointer; font-size: 16px; padding: 2px 6px; border-radius: 6px; transition: all 0.2s; }
@@ -1768,6 +1764,11 @@ function getHTML() {
           <select id="repo-sort-dir" onchange="onSortChange()">
             <option value="asc">正序 ↑</option>
             <option value="desc">倒序 ↓</option>
+          </select>
+          <select id="repo-sort-priority" onchange="onSortChange()">
+            <option value="latest">取最新</option>
+            <option value="release">Release 优先</option>
+            <option value="commit">Commit 优先</option>
           </select>
         </div>
         <ul class="repo-list" id="repo-list">
@@ -2289,6 +2290,7 @@ function getHTML() {
 
     let _sortField = localStorage.getItem('grw_sort_field') || 'updated';
     let _sortAsc = (localStorage.getItem('grw_sort_asc') || 'desc') === 'asc';
+    let _sortPriority = localStorage.getItem('grw_sort_priority') || 'latest';
     let _repoPage = 1;
     const _pageSize = 10;
 
@@ -2298,6 +2300,8 @@ function getHTML() {
       const sd = document.getElementById('repo-sort-dir');
       if (sf) sf.value = _sortField;
       if (sd) sd.value = _sortAsc ? 'asc' : 'desc';
+      const sp = document.getElementById('repo-sort-priority');
+      if (sp) sp.value = _sortPriority;
       let repos, actData;
       try {
         [{ repos }, actData] = await Promise.all([
@@ -2328,8 +2332,17 @@ function getHTML() {
           return _sortAsc ? ca.localeCompare(cb) : cb.localeCompare(ca);
         }
         if (_sortField === 'updated') {
-          const ua = actMap[(typeof a === 'string' ? a : a.repo)]?.latestRelease?.date || actMap[(typeof a === 'string' ? a : a.repo)]?.latestCommit?.date || '';
-          const ub = actMap[(typeof b === 'string' ? b : b.repo)]?.latestRelease?.date || actMap[(typeof b === 'string' ? b : b.repo)]?.latestCommit?.date || '';
+          const getUpdated = (entry) => {
+            const act = actMap[(typeof entry === 'string' ? entry : entry.repo)] || {};
+            if (_sortPriority === 'release') return act.latestRelease?.date || '';
+            if (_sortPriority === 'commit') return act.latestCommit?.date || '';
+            // latest: 取两者中较新的
+            const rd = act.latestRelease?.date || '';
+            const cd = act.latestCommit?.date || '';
+            return rd > cd ? rd : cd;
+          };
+          const ua = getUpdated(a);
+          const ub = getUpdated(b);
           return _sortAsc ? ua.localeCompare(ub) : ub.localeCompare(ua);
         }
         return 0;
@@ -2373,10 +2386,6 @@ function getHTML() {
           '<div class="repo-row">' +
             '<button class="pin-btn' + (pinned ? ' pinned' : '') + '" data-pin="' + safe + '" title="' + (pinned ? '取消置顶' : '置顶') + '">' + (pinned ? '📌' : '⬆️') + '</button>' +
             '<span class="repo-name"><a href="https://github.com/' + safe + '" target="_blank">' + safe + '</a></span>' +
-            '<select class="priority-select' + ((w.priority === 'high') ? ' high' : '') + '" data-repo="' + safe + '" data-priority onchange="onRepoPriorityChange(this)">' +
-              '<option value="normal"' + (w.priority !== 'high' ? ' selected' : '') + '>普通</option>' +
-              '<option value="high"' + (w.priority === 'high' ? ' selected' : '') + '>高优先级</option>' +
-            '</select>' +
             '<span class="repo-toggles">' +
               mkBtn('releases', '🏷️ Release') +
               mkBtn('commits', '📝 Commit') +
@@ -2407,15 +2416,6 @@ function getHTML() {
       }
     }
 
-    async function onRepoPriorityChange(sel) {
-      const repo = sel.dataset.repo;
-      const priority = sel.value;
-      try {
-        await fetchAPI('/api/repos/' + encodeURIComponent(repo), { method: 'PUT', body: JSON.stringify({ watch: { priority } }) });
-        sel.className = 'priority-select' + (priority === 'high' ? ' high' : '');
-      } catch (e) { showToast('设置失败: ' + e.message, 'error'); }
-    }
-
     function goRepoPage(page) {
       _repoPage = page;
       loadRepos();
@@ -2426,8 +2426,10 @@ function getHTML() {
     function onSortChange() {
       _sortField = document.getElementById('repo-sort-field').value;
       _sortAsc = document.getElementById('repo-sort-dir').value === 'asc';
+      _sortPriority = document.getElementById('repo-sort-priority').value;
       localStorage.setItem('grw_sort_field', _sortField);
       localStorage.setItem('grw_sort_asc', _sortAsc ? 'asc' : 'desc');
+      localStorage.setItem('grw_sort_priority', _sortPriority);
       _repoPage = 1;
       loadRepos();
     }
