@@ -94,7 +94,7 @@ export default {
       if (path.startsWith("/api/repos/") && method === "PUT") {
         const repo = decodeURIComponent(path.replace("/api/repos/", ""));
         const body = await request.json();
-        return jsonResponse(await updateRepo(repo, body.watch, env, config), corsHeaders);
+        return jsonResponse(await updateRepo(repo, body, env, config), corsHeaders);
       }
       if (path === "/api/history" && method === "GET") {
         const limit = parseInt(url.searchParams.get("limit") || "50");
@@ -286,14 +286,14 @@ async function removeRepo(repo, env, existingConfig) {
   return { success: true, removed, repos: config.watchRepos };
 }
 
-async function updateRepo(repo, watch, env, existingConfig) {
+async function updateRepo(repo, body, env, existingConfig) {
   const config = existingConfig || await getConfig(env);
   if (config.watchRepos) {
     const idx = config.watchRepos.findIndex((r) => (typeof r === "string" ? r : r.repo) === repo);
     if (idx !== -1) {
       const entry = config.watchRepos[idx];
       const current = typeof entry === "string" ? { repo: entry, watch: normalizeWatch() } : entry;
-      if (watch) current.watch = { ...current.watch, ...watch };
+      if (body.watch) current.watch = { ...current.watch, ...body.watch };
       if (body.pinned !== undefined) current.pinned = !!body.pinned;
       config.watchRepos[idx] = current;
       await env.WATCHER_STATE.put("config", JSON.stringify(config));
@@ -1472,6 +1472,12 @@ function getHTML() {
     .pin-btn:hover { background: var(--btn-secondary-hover); }
     .pin-btn.pinned { color: #ffd700; }
     .pin-btn:not(.pinned) { color: var(--text-dim); }
+    .pagination { display: flex; justify-content: center; align-items: center; gap: 8px; margin-top: 16px; padding: 12px 0; }
+    .pagination button { padding: 6px 14px; border-radius: 8px; border: 1px solid var(--btn-secondary-border); background: var(--btn-secondary-bg); color: var(--text-primary); font-size: 13px; cursor: pointer; transition: all 0.2s; }
+    .pagination button:hover:not(:disabled) { background: var(--btn-secondary-hover); }
+    .pagination button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .pagination button.active { background: var(--accent); color: var(--btn-primary-color); border-color: var(--accent); font-weight: 600; }
+    .pagination .page-info { color: var(--text-muted); font-size: 13px; }
     .sort-bar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
     .sort-bar label { font-size: 13px; color: var(--text-muted); margin-bottom: 0; }
     .sort-bar select { padding: 6px 10px; background: var(--input-bg); border: 1px solid var(--input-border); border-radius: 8px; color: var(--text-primary); font-size: 13px; }
@@ -2277,10 +2283,17 @@ function getHTML() {
       return new Date(dateStr).toLocaleDateString('zh-CN');
     }
 
-    let _sortField = 'default';
-    let _sortAsc = true;
+    let _sortField = localStorage.getItem('grw_sort_field') || 'updated';
+    let _sortAsc = (localStorage.getItem('grw_sort_asc') || 'desc') === 'asc';
+    let _repoPage = 1;
+    const _pageSize = 10;
 
     async function loadRepos() {
+      // Sync select controls with current state
+      const sf = document.getElementById('repo-sort-field');
+      const sd = document.getElementById('repo-sort-dir');
+      if (sf) sf.value = _sortField;
+      if (sd) sd.value = _sortAsc ? 'asc' : 'desc';
       const [{ repos }, actData] = await Promise.all([
         fetchAPI('/api/repos'),
         fetchAPI('/api/repos/activity').catch(() => ({ activity: [] })),
@@ -2317,10 +2330,16 @@ function getHTML() {
         list.innerHTML = '<li class="empty-state">暂无监控仓库，请添加</li>';
         return;
       }
-      list.innerHTML = sorted.map(r => {
+      // Pagination
+      const totalPages = Math.ceil(sorted.length / _pageSize);
+      if (_repoPage > totalPages) _repoPage = totalPages;
+      if (_repoPage < 1) _repoPage = 1;
+      const pageStart = (_repoPage - 1) * _pageSize;
+      const pageItems = sorted.slice(pageStart, pageStart + _pageSize);
+      list.innerHTML = pageItems.map(r => {
         const repo = typeof r === 'string' ? r : r.repo;
         const w = (typeof r === 'string' ? {} : r.watch) || {};
-        const pinned = r.pinned || false;
+        const pinned = !!r.pinned;
         const safe = escapeHTML(repo);
         const act = actMap[repo];
         const mkBtn = (key, label) => '<button class="toggle-btn ' + (w[key] ? 'on' : '') + '" data-repo="' + safe + '" data-watch="' + key + '">' + label + '</button>';
@@ -2342,7 +2361,7 @@ function getHTML() {
         }
         return '<li class="repo-item' + (pinned ? ' pinned' : '') + '">' +
           '<div class="repo-row">' +
-            '<button class="pin-btn' + (pinned ? ' pinned' : '') + '" data-pin="' + safe + '" title="' + (pinned ? '取消置顶' : '置顶') + '">' + (pinned ? '📌' : '📍') + '</button>' +
+            '<button class="pin-btn' + (pinned ? ' pinned' : '') + '" data-pin="' + safe + '" title="' + (pinned ? '取消置顶' : '置顶') + '">' + (pinned ? '📌' : '☆') + '</button>' +
             '<span class="repo-name"><a href="https://github.com/' + safe + '" target="_blank">' + safe + '</a></span>' +
             '<span class="repo-toggles">' +
               mkBtn('releases', '🏷️ Release') +
@@ -2358,11 +2377,35 @@ function getHTML() {
           activity +
         '</li>';
       }).join('');
+      // Render pagination
+      if (totalPages > 1) {
+        let pagHtml = '<div class="pagination">';
+        pagHtml += '<button ' + (_repoPage <= 1 ? 'disabled' : '') + ' onclick="goRepoPage(' + (_repoPage - 1) + ')">‹ 上一页</button>';
+        for (let i = 1; i <= totalPages; i++) {
+          pagHtml += '<button class="' + (i === _repoPage ? 'active' : '') + '" onclick="goRepoPage(' + i + ')">' + i + '</button>';
+        }
+        pagHtml += '<button ' + (_repoPage >= totalPages ? 'disabled' : '') + ' onclick="goRepoPage(' + (_repoPage + 1) + ')">下一页 ›</button>';
+        pagHtml += '<span class="page-info">' + sorted.length + ' 个仓库，第 ' + _repoPage + '/' + totalPages + ' 页</span>';
+        pagHtml += '</div>';
+        list.innerHTML += pagHtml;
+      } else {
+        list.innerHTML += '<div class="pagination"><span class="page-info">' + sorted.length + ' 个仓库</span></div>';
+      }
+    }
+
+    function goRepoPage(page) {
+      _repoPage = page;
+      loadRepos();
+      // Scroll to repo list top
+      document.getElementById('repo-list').scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
 
     function onSortChange() {
       _sortField = document.getElementById('repo-sort-field').value;
       _sortAsc = document.getElementById('repo-sort-dir').value === 'asc';
+      localStorage.setItem('grw_sort_field', _sortField);
+      localStorage.setItem('grw_sort_asc', _sortAsc ? 'asc' : 'desc');
+      _repoPage = 1;
       loadRepos();
     }
 
