@@ -1401,6 +1401,13 @@ function getHTML() {
       font-weight: 500;
       color: var(--text-secondary);
     }
+    label:has(input[type="checkbox"]) {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+      margin-bottom: 0;
+    }
     input, textarea {
       width: 100%;
       padding: 12px 16px;
@@ -1495,11 +1502,15 @@ function getHTML() {
       border: 1px solid var(--card-border-light);
     }
     .stat-value {
-      font-size: 2em;
+      font-size: 1.6em;
       font-weight: 700;
       background: var(--accent-gradient);
       -webkit-background-clip: text;
       -webkit-text-fill-color: transparent;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: 100%;
     }
     .stat-label {
       color: var(--text-muted);
