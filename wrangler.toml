@@ -16,10 +16,9 @@ id = "c166e000694c4838a79b07fca53d61e2"
 # ── Variables ──
 [vars]
 CRON_SCHEDULE = "*/30 * * * *"
-# DASHBOARD_URL 用于周报通知中的回链地址，留空则自动使用请求域名
-DASHBOARD_URL = ""
 
 # ── Secrets（通过 wrangler secret put 设置，不出现在代码仓库中）──
 # UPDATE_HUB_URL   — Update Hub 地址
 # UPDATE_HUB_TOKEN — Update Hub 认证 Token
 # CRON_SECRET      — GitHub Actions 调用 /api/cron/trigger 的鉴权 Token
+# DASHBOARD_URL    — 周报通知中的回链地址（留空则 fallback 到 GitHub 仓库地址）
