@@ -133,7 +133,7 @@ GitHub Actions 的 `check.yml` 会使用同一个 secret 调用 `/api/cron/trigg
 ### 6. 配置自定义域名（可选）
 
 ```bash
-npx wrangler custom-domain add github-repo-watcher.xinming.dpdns.org
+npx wrangler custom-domain add <your-custom-domain>
 ```
 
 ### 7. 通过网页配置
