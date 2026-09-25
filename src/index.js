@@ -1802,7 +1802,25 @@ function getHTML() {
       .card { padding: 20px; }
       .btn-group { flex-direction: column; }
       .add-repo { flex-direction: column; }
+      .sort-bar { flex-wrap: wrap; }
+      .sort-bar select, .sort-bar input { flex: 1; min-width: 120px; }
+      .batch-bar { flex-wrap: wrap; }
+      .repo-row { flex-wrap: wrap; }
+      .repo-name { min-width: 100%; }
+      .repo-toggles { flex-wrap: wrap; }
+      #compare-table { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+      #compare-table table { min-width: 560px; }
+      .settings-row { flex-direction: column; }
+      .filter-row { flex-direction: column; }
     }
+    .batch-bar { display: flex; align-items: center; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+    .batch-bar label { display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 14px; color: var(--text-secondary); }
+    .batch-bar select { padding: 6px 10px; background: var(--input-bg); border: 1px solid var(--input-border); border-radius: 8px; color: var(--text-primary); font-size: 13px; }
+    .repo-check { width: 18px; height: 18px; accent-color: var(--accent); cursor: pointer; flex-shrink: 0; }
+    .stars-svg { width: 100%; height: auto; display: block; margin-bottom: 12px; color: var(--text-secondary); }
+    .stars-legend { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 12px; }
+    .stars-legend-item { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-secondary); }
+    .stars-legend-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
 
     details { margin-bottom: 24px; }
     details > summary {
@@ -1938,10 +1956,26 @@ function getHTML() {
             <option value="fork">🍴 Fork</option>
             <option value="pr_merge">✅ PR Merge</option>
           </select>
+          <input type="text" id="repo-search" placeholder="🔍 搜索仓库…" oninput="onRepoSearch()" style="flex:1;min-width:140px">
         </div>
         <ul class="repo-list" id="repo-list">
           <li class="empty-state">加载中…</li>
         </ul>
+        <div class="batch-bar">
+          <label><input type="checkbox" id="batch-select-all" onchange="toggleSelectAll(this.checked)"> 全选</label>
+          <select id="batch-watch-key">
+            <option value="releases">🏷️ Release</option>
+            <option value="commits">📝 Commit</option>
+            <option value="actions">⚡ Actions</option>
+            <option value="issues">🆕 Issue</option>
+            <option value="prs">🔀 PR</option>
+            <option value="forks">🍴 Fork</option>
+            <option value="prReviews">✅ PR Merge</option>
+          </select>
+          <button class="btn btn-secondary btn-sm" onclick="batchSetWatch(true)">批量开启</button>
+          <button class="btn btn-secondary btn-sm" onclick="batchSetWatch(false)">批量关闭</button>
+          <button class="btn btn-danger btn-sm" onclick="batchDelete()">批量删除</button>
+        </div>
         <div class="add-repo">
           <input type="text" id="new-repo" placeholder="输入仓库名，如 facebook/react">
           <button class="btn btn-primary" id="btn-add-repo" onclick="addRepo()">➕ 添加</button>
@@ -2101,6 +2135,19 @@ function getHTML() {
       </div>
     </details>
 
+    <!-- 6.5 Config Backup -->
+    <details>
+      <summary><h2>💾 配置备份</h2></summary>
+      <div class="card-inner">
+        <p style="color:var(--text-muted);font-size:13px;margin-bottom:12px">导出仓库列表、过滤规则、告警等配置（不含 Token 密钥）。导入会覆盖对应配置项。</p>
+        <div class="settings-row">
+          <button class="btn btn-secondary" onclick="exportConfig()">⬇️ 导出配置</button>
+          <button class="btn btn-secondary" onclick="triggerImport()">⬆️ 导入配置</button>
+          <input type="file" id="import-file" accept="application/json" style="display:none" onchange="importConfig(this)">
+        </div>
+      </div>
+    </details>
+
     <!-- 7. Keyword Alerts -->
     <details>
       <summary><h2>🔔 关键词告警</h2></summary>
@@ -2108,15 +2155,16 @@ function getHTML() {
         <p style="color:var(--text-muted);font-size:13px;margin-bottom:12px">当 commit 消息包含指定关键词时发送告警通知。仓库填 * 表示所有仓库。</p>
         <ul class="keyword-list" id="keyword-list"><li class="empty-state">暂无告警规则</li></ul>
         <div class="add-repo" style="margin-top:12px">
-          <input type="text" id="kw-repo" placeholder="仓库名或 *" style="flex:0.5">
+          <input type="text" id="kw-repo" list="kw-repo-list" placeholder="仓库名或 *" style="flex:0.5">
+          <datalist id="kw-repo-list"></datalist>
           <input type="text" id="kw-keyword" placeholder="如 CVE, security, breaking" style="flex:1">
           <button class="btn btn-primary" onclick="addKeywordAlert()">➕ 添加</button>
         </div>
       </div>
     </details>
 
-    <!-- 7. Stars Trends (hidden) -->
-    <details style="display:none">
+    <!-- 7. Stars Trends -->
+    <details>
       <summary><h2>⭐ Stars 趋势</h2></summary>
       <div class="card-inner">
         <div id="stars-chart"><div class="empty-state">加载中...</div></div>
@@ -2146,9 +2194,32 @@ function getHTML() {
         <button class="btn btn-danger btn-sm" id="btn-clear-history" onclick="event.stopPropagation();clearHistory()" style="margin-left:auto">🗑️ 清空</button>
       </summary>
       <div class="card-inner">
+        <div class="sort-bar">
+          <select id="history-time" onchange="setHistoryFilter(this.value)">
+            <option value="all">全部时间</option>
+            <option value="1">近 1 天</option>
+            <option value="7">近 7 天</option>
+            <option value="30">近 30 天</option>
+          </select>
+          <select id="history-type" onchange="onHistoryFilterChange()">
+            <option value="all">全部类型</option>
+            <option value="release">🏷️ Release</option>
+            <option value="commit">📝 Commit</option>
+            <option value="action">⚡ Actions</option>
+            <option value="issue">🆕 Issue</option>
+            <option value="pr">🔀 PR</option>
+            <option value="pr_merge">✅ PR Merge</option>
+            <option value="keyword">🔔 关键词</option>
+            <option value="star_milestone">⭐ Star</option>
+            <option value="fork">🍴 Fork</option>
+            <option value="error">❌ 错误</option>
+          </select>
+          <input type="text" id="history-search" placeholder="🔍 搜索仓库 / 内容…" oninput="onHistoryFilterChange()" style="flex:1;min-width:140px">
+        </div>
         <div id="history-list">
           <div class="empty-state">暂无通知记录</div>
         </div>
+        <button class="btn btn-secondary btn-sm" id="btn-history-more" onclick="loadMoreHistory()" style="display:none;width:100%;margin-top:12px">加载更多</button>
       </div>
     </details>
   </div>
@@ -2448,7 +2519,14 @@ function getHTML() {
     let _sortAsc = (localStorage.getItem('grw_sort_asc') || 'desc') === 'asc';
     let _sortPriority = localStorage.getItem('grw_sort_priority') || 'latest';
     let _repoPage = 1;
+    let _repoSearch = '';
     const _pageSize = 10;
+
+    function onRepoSearch() {
+      _repoSearch = document.getElementById('repo-search').value.trim().toLowerCase();
+      _repoPage = 1;
+      loadRepos();
+    }
 
     async function loadRepos() {
       // Sync select controls with current state
@@ -2471,8 +2549,23 @@ function getHTML() {
       const actMap = {};
       (actData.activity || []).forEach(a => { actMap[a.repo] = a; });
 
+      // Keep the keyword-alert repo datalist in sync with watched repos
+      const dl = document.getElementById('kw-repo-list');
+      if (dl) {
+        dl.innerHTML = '<option value="*">所有仓库</option>' + repos.map(r => {
+          const name = typeof r === 'string' ? r : r.repo;
+          return '<option value="' + escapeHTML(name) + '">';
+        }).join('');
+      }
+
+      // Search filter
+      const visible = _repoSearch ? repos.filter(r => {
+        const name = typeof r === 'string' ? r : r.repo;
+        return name.toLowerCase().includes(_repoSearch);
+      }) : repos;
+
       // Sort: pinned always first, then by chosen field
-      const sorted = repos.slice().sort((a, b) => {
+      const sorted = visible.slice().sort((a, b) => {
         const pa = a.pinned ? 1 : 0;
         const pb = b.pinned ? 1 : 0;
         if (pa !== pb) return pb - pa;
@@ -2544,6 +2637,7 @@ function getHTML() {
         }
         return '<li class="repo-item' + (pinned ? ' pinned' : '') + '">' +
           '<div class="repo-row">' +
+            '<input type="checkbox" class="repo-check" data-repo-check="' + safe + '" title="选择">' +
             '<button class="pin-btn' + (pinned ? ' pinned' : '') + '" data-pin="' + safe + '" title="' + (pinned ? '取消置顶' : '置顶') + '">' + (pinned ? '📌' : '⬆️') + '</button>' +
             '<span class="repo-name"><a href="https://github.com/' + safe + '" target="_blank">' + safe + '</a></span>' +
             '<span class="repo-toggles">' +
@@ -2592,6 +2686,91 @@ function getHTML() {
       localStorage.setItem('grw_sort_priority', _sortPriority);
       _repoPage = 1;
       loadRepos();
+    }
+
+    function getCheckedRepos() {
+      return Array.from(document.querySelectorAll('.repo-check:checked')).map(cb => cb.dataset.repoCheck);
+    }
+
+    function toggleSelectAll(checked) {
+      document.querySelectorAll('.repo-check').forEach(cb => { cb.checked = checked; });
+    }
+
+    async function batchSetWatch(enabled) {
+      const repos = getCheckedRepos();
+      if (repos.length === 0) { showToast('请先勾选仓库', 'error'); return; }
+      const key = document.getElementById('batch-watch-key').value;
+      const body = { watch: {} };
+      body.watch[key] = !!enabled;
+      let ok = 0;
+      for (const repo of repos) {
+        try {
+          await fetchAPI('/api/repos/' + encodeURIComponent(repo), { method: 'PUT', body: JSON.stringify(body) });
+          ok++;
+        } catch (e) { /* skip */ }
+      }
+      showToast('已更新 ' + ok + ' 个仓库');
+      loadRepos();
+    }
+
+    async function batchDelete() {
+      const repos = getCheckedRepos();
+      if (repos.length === 0) { showToast('请先勾选仓库', 'error'); return; }
+      if (!confirm('确定删除选中的 ' + repos.length + ' 个仓库？')) return;
+      let ok = 0;
+      for (const repo of repos) {
+        try {
+          await fetchAPI('/api/repos/' + encodeURIComponent(repo), { method: 'DELETE' });
+          ok++;
+        } catch (e) { /* skip */ }
+      }
+      showToast('已删除 ' + ok + ' 个仓库');
+      loadRepos();
+      loadStatus();
+    }
+
+    // ── Config export / import (never moves secrets) ──
+
+    async function exportConfig() {
+      try {
+        const config = await fetchAPI('/api/config');
+        // Never export secrets — tokens/URLs/password stay on the server
+        ['telegramBotToken', 'telegramChatId', 'githubToken', 'notifyDiscord', 'notifySlack', 'notifyWebhook', 'updatedAt'].forEach(k => delete config[k]);
+        const blob = new Blob([JSON.stringify(config, null, 2)], { type: 'application/json' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'repo-watcher-config-' + new Date().toISOString().slice(0, 10) + '.json';
+        a.click();
+        URL.revokeObjectURL(a.href);
+        showToast('配置已导出（不含密钥）');
+      } catch (e) {
+        showToast('导出失败: ' + e.message, 'error');
+      }
+    }
+
+    function triggerImport() {
+      document.getElementById('import-file').click();
+    }
+
+    async function importConfig(input) {
+      const file = input.files && input.files[0];
+      input.value = '';
+      if (!file) return;
+      try {
+        const data = JSON.parse(await file.text());
+        // Never write masked placeholders to the server
+        Object.keys(data).forEach(k => {
+          if (typeof data[k] === 'string' && data[k].includes('••••')) delete data[k];
+        });
+        delete data.updatedAt;
+        await fetchAPI('/api/config', { method: 'POST', body: JSON.stringify(data) });
+        showToast('配置已导入');
+        loadConfig();
+        loadRepos();
+        loadStatus();
+      } catch (e) {
+        showToast('导入失败: ' + e.message, 'error');
+      }
     }
 
     async function togglePin(repo) {
@@ -2673,31 +2852,64 @@ function getHTML() {
     }
 
     let _historyFilter = 'all';
+    let _historyType = 'all';
+    let _historySearch = '';
+    let _historyShown = 30;
+    let _historyCache = [];
 
-    function setHistoryFilter(days, btn) {
+    function setHistoryFilter(days) {
       _historyFilter = days;
-      document.querySelectorAll('#history-list').forEach(el => el.previousElementSibling?.querySelectorAll?.('.toggle-btn')).forEach(() => {});
-      // Update button states
-      const bar = btn.closest('.sort-bar');
-      if (bar) bar.querySelectorAll('.toggle-btn').forEach(b => b.classList.remove('on'));
-      btn.classList.add('on');
-      loadHistory();
+      _historyShown = 30;
+      renderHistory();
+    }
+
+    function onHistoryFilterChange() {
+      _historyType = document.getElementById('history-type').value;
+      _historySearch = document.getElementById('history-search').value.trim().toLowerCase();
+      _historyShown = 30;
+      renderHistory();
+    }
+
+    function loadMoreHistory() {
+      _historyShown += 30;
+      renderHistory();
     }
 
     async function loadHistory() {
-      const { history } = await fetchAPI('/api/history?limit=100');
-      const list = document.getElementById('history-list');
-      // Apply time filter
-      let filtered = history;
-      if (_historyFilter !== 'all') {
-        const cutoff = Date.now() - _historyFilter * 24 * 60 * 60 * 1000;
-        filtered = history.filter(h => new Date(h.timestamp).getTime() > cutoff);
-      }
-      if (filtered.length === 0) {
-        list.innerHTML = '<div class="empty-state">暂无通知记录</div>';
+      try {
+        const { history } = await fetchAPI('/api/history?limit=200');
+        _historyCache = history || [];
+      } catch (e) {
         return;
       }
-      list.innerHTML = filtered.slice(0, 30).map(h => {
+      renderHistory();
+    }
+
+    function renderHistory() {
+      const list = document.getElementById('history-list');
+      const moreBtn = document.getElementById('btn-history-more');
+      // Time / type / search filters
+      let filtered = _historyCache;
+      if (_historyFilter !== 'all') {
+        const cutoff = Date.now() - _historyFilter * 24 * 60 * 60 * 1000;
+        filtered = filtered.filter(h => new Date(h.timestamp).getTime() > cutoff);
+      }
+      if (_historyType !== 'all') {
+        filtered = filtered.filter(h => h.type === _historyType || (_historyType === 'commit' && h.type === 'commits'));
+      }
+      if (_historySearch) {
+        filtered = filtered.filter(h => {
+          const hay = [h.repo, h.name, h.tag, h.title, h.message, h.keyword, h.sha].filter(Boolean).join(' ').toLowerCase();
+          return hay.includes(_historySearch);
+        });
+      }
+      if (filtered.length === 0) {
+        list.innerHTML = '<div class="empty-state">暂无匹配记录</div>';
+        if (moreBtn) moreBtn.style.display = 'none';
+        return;
+      }
+      if (moreBtn) moreBtn.style.display = filtered.length > _historyShown ? '' : 'none';
+      list.innerHTML = filtered.slice(0, _historyShown).map(h => {
         const repo = escapeHTML(h.repo || '');
         const name = escapeHTML(h.name || h.tag || '');
         const sha = escapeHTML(h.sha || '');
@@ -2931,6 +3143,50 @@ function getHTML() {
     }
 
     let _starsSort = 'stars-desc';
+
+    function renderStarsChart(sorted) {
+      // Pure-SVG multi-series line chart (no dependencies)
+      const series = sorted.filter(s => s.history && s.history.length >= 2).slice(0, 6);
+      if (series.length === 0) return '';
+      const W = 720, H = 240, PL = 56, PR = 12, PT = 16, PB = 32;
+      const colors = ['#00d9ff', '#00ff88', '#ffb020', '#ff6b6b', '#b388ff', '#ff80ab'];
+      const maxLen = Math.max(...series.map(s => s.history.length));
+      let vMin = Infinity, vMax = -Infinity;
+      series.forEach(s => s.history.forEach(p => {
+        if (p.stars < vMin) vMin = p.stars;
+        if (p.stars > vMax) vMax = p.stars;
+      }));
+      if (vMin === vMax) { vMin = Math.max(0, vMin - 1); vMax += 1; }
+      const x = i => PL + (maxLen <= 1 ? 0 : i / (maxLen - 1)) * (W - PL - PR);
+      const y = v => PT + (1 - (v - vMin) / (vMax - vMin)) * (H - PT - PB);
+      let svg = '<svg class="stars-svg" viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Stars 趋势图">';
+      // Grid + y labels
+      for (let g = 0; g <= 4; g++) {
+        const gv = vMin + (vMax - vMin) * g / 4;
+        const gy = y(gv);
+        svg += '<line x1="' + PL + '" y1="' + gy + '" x2="' + (W - PR) + '" y2="' + gy + '" stroke="currentColor" stroke-opacity="0.12" />';
+        svg += '<text x="' + (PL - 8) + '" y="' + (gy + 4) + '" text-anchor="end" font-size="11" fill="currentColor" fill-opacity="0.5">' + Math.round(gv).toLocaleString() + '</text>';
+      }
+      // Lines
+      series.forEach((s, si) => {
+        const pts = s.history.map((p, i) => x(i) + ',' + y(p.stars)).join(' ');
+        svg += '<polyline points="' + pts + '" fill="none" stroke="' + colors[si % colors.length] + '" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" />';
+        const last = s.history[s.history.length - 1];
+        svg += '<circle cx="' + x(s.history.length - 1) + '" cy="' + y(last.stars) + '" r="3.5" fill="' + colors[si % colors.length] + '" />';
+      });
+      // X labels: first / mid / last date of the longest series
+      const longest = series.reduce((a, b) => a.history.length >= b.history.length ? a : b);
+      [0, Math.floor((longest.history.length - 1) / 2), longest.history.length - 1].forEach(i => {
+        const d = longest.history[i] && longest.history[i].date ? longest.history[i].date.slice(5) : '';
+        svg += '<text x="' + x(i) + '" y="' + (H - 8) + '" text-anchor="middle" font-size="11" fill="currentColor" fill-opacity="0.5">' + d + '</text>';
+      });
+      svg += '</svg>';
+      const legend = '<div class="stars-legend">' + series.map((s, si) =>
+        '<span class="stars-legend-item"><span class="stars-legend-dot" style="background:' + colors[si % colors.length] + '"></span>' + escapeHTML(s.repo) + ' · ⭐' + s.stars.toLocaleString() + '</span>'
+      ).join('') + '</div>';
+      return svg + legend;
+    }
+
     async function loadStars() {
       try {
         const { stars } = await fetchAPI('/api/stars/history');
@@ -2950,7 +3206,7 @@ function getHTML() {
           if (_starsSort === 'name') return a.repo.localeCompare(b.repo);
           return 0;
         });
-        container.innerHTML = sorted.map(s => {
+        container.innerHTML = renderStarsChart(sorted) + sorted.map(s => {
           const delta = s.history.length >= 2 ? s.stars - s.history[0].stars : 0;
           const deltaStr = delta > 0 ? '+' + delta : delta < 0 ? String(delta) : '';
           return '<div class="stars-row">' +
@@ -3057,9 +3313,26 @@ function getHTML() {
         document.getElementById('summary-content').innerHTML = '<div class="empty-state">加载失败</div>';
       }
     }
+    // ── Auto refresh (paused while the tab is hidden) ──
+
+    let _refreshTimer = null;
+    function startAutoRefresh() {
+      if (_refreshTimer) clearInterval(_refreshTimer);
+      _refreshTimer = setInterval(() => {
+        if (document.hidden) return;
+        Promise.all([loadStatus(), loadHistory()]).catch(() => {});
+      }, 60000);
+    }
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) {
+        Promise.all([loadStatus(), loadHistory()]).catch(() => {});
+      }
+    });
+
     // Init
     async function initApp() {
-      await Promise.all([loadStatus(), loadConfig(), loadRepos(), loadHistory(), loadCompare(), loadSummary()]);
+      await Promise.all([loadStatus(), loadConfig(), loadRepos(), loadHistory(), loadCompare(), loadSummary(), loadStars()]);
+      startAutoRefresh();
     }
 
     (async function init() {
