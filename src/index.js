@@ -278,7 +278,7 @@ async function getRepos(env, existingConfig) {
 }
 
 function normalizeWatch(w) {
-  if (!w) return { releases: true, commits: true, actions: false, issues: false, prs: false, forks: false, prReviews: false };
+  if (!w) return { releases: true, commits: true, actions: false, issues: false, prs: false, forks: false, prReviews: false, ignorePreRelease: false };
   return {
     releases: w.releases !== undefined ? w.releases : true,
     commits: w.commits !== undefined ? w.commits : true,
@@ -287,6 +287,7 @@ function normalizeWatch(w) {
     prs: w.prs !== undefined ? w.prs : false,
     forks: w.forks !== undefined ? w.forks : false,
     prReviews: w.prReviews !== undefined ? w.prReviews : false,
+    ignorePreRelease: w.ignorePreRelease !== undefined ? w.ignorePreRelease : false,
   };
 }
 
@@ -688,7 +689,7 @@ async function checkAllRepos(env) {
 async function checkRepo(repo, watch, config, env) {
   let sent = 0;
   const filters = config.filters || {};
-  if (watch.releases) sent += await checkReleases(repo, config, env, filters);
+  if (watch.releases) sent += await checkReleases(repo, config, env, filters, watch);
   if (watch.commits) sent += await checkCommits(repo, config, env, filters);
   if (watch.actions) sent += await checkActions(repo, config, env, filters);
   if (watch.issues) sent += await checkIssues(repo, config, env, filters);
@@ -704,7 +705,7 @@ async function checkRepo(repo, watch, config, env) {
   return sent;
 }
 
-async function checkReleases(repo, config, env, filters) {
+async function checkReleases(repo, config, env, filters, watch) {
   const data = await githubAPI(`/repos/${repo}/releases?per_page=5`, config);
   if (!data || !Array.isArray(data) || data.length === 0) return 0;
 
@@ -739,8 +740,8 @@ async function checkReleases(repo, config, env, filters) {
     const isPre = release.prerelease ? " (Pre-release)" : "";
     const date = new Date(release.published_at).toLocaleDateString("zh-CN");
 
-    // Filter: skip pre-release if configured
-    if (filters.ignorePreRelease && release.prerelease) continue;
+    // Filter: skip pre-release if configured (global filter OR per-repo setting)
+    if ((filters.ignorePreRelease || (watch && watch.ignorePreRelease)) && release.prerelease) continue;
     // Filter: tag keyword
     if (filters.tagKeyword && !tag.toLowerCase().includes(filters.tagKeyword.toLowerCase())) continue;
 
@@ -2642,6 +2643,7 @@ function getHTML() {
             '<span class="repo-name"><a href="https://github.com/' + safe + '" target="_blank">' + safe + '</a></span>' +
             '<span class="repo-toggles">' +
               mkBtn('releases', '🏷️ Release') +
+              mkBtn('ignorePreRelease', '🚫 Pre') +
               mkBtn('commits', '📝 Commit') +
               mkBtn('actions', '⚡ Actions') +
               mkBtn('issues', '🆕 Issue') +
