@@ -585,7 +585,8 @@ async function checkAllRepos(env) {
             `📋 <b>Weekly Summary</b>\n` +
             `本周共 ${summary.totalEvents} 条事件\n` +
             lines + '\n' +
-            `<a href="https://github-repo-watcher.xinming.dpdns.org">View Dashboard →</a>`;
+            `#GitHub仓库更新 #周报\n` +
+      `<a href="https://github-repo-watcher.xinming.dpdns.org">View Dashboard →</a>`;
           await sendNotification(message, config);
           await addHistoryEntry({ type: "weekly_summary", eventCount: summary.totalEvents, repoCount: repos.length }, env);
           notifications++;
@@ -655,6 +656,7 @@ async function checkReleases(repo, config, env, filters) {
       `<b>${escapeHTML(name)}</b>${escapeHTML(isPre)}\n` +
       `Tag: <code>${escapeHTML(tag)}</code>\n` +
       `Date: ${date}\n` +
+      `#GitHub仓库更新 #Release\n` +
       `<a href="${url}">View on GitHub →</a>`;
 
     // Filter: skip pre-release if configured
@@ -710,6 +712,7 @@ async function checkCommits(repo, config, env, filters) {
       `<b>${escapeHTML(repo)}</b>\n` +
       `<code>${shortSha}</code> ${escapeHTML(msg)}\n` +
       `By ${escapeHTML(author)} · ${date}\n` +
+      `#GitHub仓库更新 #Commit\n` +
       `<a href="${c.html_url}">View on GitHub →</a>`;
 
     // Filter: ignore authors
@@ -750,6 +753,7 @@ async function checkCommits(repo, config, env, filters) {
     const message =
       `📝 <b>${filtered.length} New Commits</b>\n` +
       `<b>${escapeHTML(repo)}</b>\n${lines}\n` +
+      `#GitHub仓库更新 #Commits\n` +
       `<a href="${compareUrl}">View changes →</a>`;
 
     await sendNotification(message, config);
@@ -796,6 +800,7 @@ async function checkActions(repo, config, env, filters) {
       `Branch: <code>${escapeHTML(branch)}</code>\n` +
       `Result: ${escapeHTML(run.conclusion || "completed")}\n` +
       `Date: ${date}\n` +
+      `#GitHub仓库更新 #Actions\n` +
       `<a href="${run.html_url}">View on GitHub →</a>`;
 
     // Filter: only failures
@@ -844,6 +849,7 @@ async function checkIssues(repo, config, env, filters) {
       `<b>${escapeHTML(repo)}</b>\n` +
       `#${issue.number} ${escapeHTML(title)}\n` +
       `By ${escapeHTML(issue.user?.login || "unknown")}\n` +
+      `#GitHub仓库更新 #Issue\n` +
       `<a href="${issue.html_url}">View on GitHub →</a>`;
 
     await sendNotification(message, config);
@@ -878,6 +884,7 @@ async function checkPRs(repo, config, env, filters) {
       `<b>${escapeHTML(repo)}</b>\n` +
       `#${pr.number} ${escapeHTML(title)}\n` +
       `By ${escapeHTML(pr.user?.login || "unknown")}\n` +
+      `#GitHub仓库更新 #PR\n` +
       `<a href="${pr.html_url}">View on GitHub →</a>`;
 
     await sendNotification(message, config);
@@ -1148,7 +1155,7 @@ async function reportToUpdateHub(env, { version, title, body, status, diff_url, 
 
 async function sendNotification(text, config, priority) {
   const prefix = priority === 'high' ? '🔴 ' : '';
-  const fullText = prefix + text;
+  const fullText = prefix + text + '\n\n#GitHub仓库监控 #更新同步平台';
   // Always try Telegram
   try {
     await sendTelegram(fullText, config);
