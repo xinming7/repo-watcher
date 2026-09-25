@@ -9,8 +9,8 @@ binding = "WATCHER_STATE"
 id = "c166e000694c4838a79b07fca53d61e2"
 
 # ── Cron Triggers ──
-# Now handled by GitHub Actions (see .github/workflows/check.yml)
-# CRON_SECRET is set via `wrangler secret put CRON_SECRET` for auth
+[triggers]
+crons = ["*/30 * * * *"]
 
 # Note: All sensitive config (tokens, chat ID, repo list) is now stored in KV
 # via the web dashboard. No need for wrangler secrets for runtime config.
@@ -18,3 +18,5 @@ id = "c166e000694c4838a79b07fca53d61e2"
 # ── Variables ──
 [vars]
 CRON_SCHEDULE = "*/30 * * * *"
+UPDATE_HUB_URL = "https://update-hub.xinming.dpdns.org"
+# UPDATE_HUB_TOKEN 通过 `wrangler secret put UPDATE_HUB_TOKEN` 设置
