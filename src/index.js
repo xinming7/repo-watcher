@@ -1114,11 +1114,12 @@ async function reportToUpdateHub(env, { version, title, body, status, diff_url, 
 // ── Multi-channel notification ──
 
 async function sendNotification(text, config, priority) {
-  const p = priority || config.notificationPriority || 'normal';
-  const prefix = p === 'high' ? '🔴 ' : '';
+  const prefix = priority === 'high' ? '🔴 ' : '';
   const fullText = prefix + text;
   // Always try Telegram
-  await sendTelegram(fullText, config);
+  try {
+    await sendTelegram(fullText, config);
+  } catch (e) { console.error('Telegram notify failed:', e.message); }
   // Discord webhook
   if (config.notifyDiscord) {
     try {
