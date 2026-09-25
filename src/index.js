@@ -674,7 +674,7 @@ async function checkAllRepos(env) {
             `本周共 ${summary.totalEvents} 条事件\n` +
             lines + '\n' +
             `#GitHub仓库更新 #周报\n` +
-      `<a href="https://github-repo-watcher.xinming.dpdns.org">View Dashboard →</a>`;
+      `<a href="${env.DASHBOARD_URL || 'https://github.com/xinming7/repo-watcher'}">View Dashboard →</a>`;
           await sendNotification(message, config);
           await addHistoryEntry({ type: "weekly_summary", eventCount: summary.totalEvents, repoCount: repos.length }, env);
           notifications++;

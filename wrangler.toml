@@ -4,6 +4,7 @@ compatibility_date = "2024-01-01"
 
 # ── KV Namespace for storing state ──
 # Run `wrangler kv:namespace create WATCHER_STATE` to get the id
+# 实际 ID 通过 `wrangler kv:namespace create WATCHER_STATE` 生成，每个 Cloudflare 账户不同
 [[kv_namespaces]]
 binding = "WATCHER_STATE"
 id = "c166e000694c4838a79b07fca53d61e2"
@@ -12,11 +13,13 @@ id = "c166e000694c4838a79b07fca53d61e2"
 # 定时检查由 GitHub Actions 驱动（.github/workflows/check.yml）
 # 通过 /api/cron/trigger 端点触发，不在 Cloudflare 侧注册 cron
 
-# Note: All sensitive config (tokens, chat ID, repo list) is now stored in KV
-# via the web dashboard. No need for wrangler secrets for runtime config.
-
 # ── Variables ──
 [vars]
 CRON_SCHEDULE = "*/30 * * * *"
-UPDATE_HUB_URL = "https://update-hub.xinming.dpdns.org"
-# UPDATE_HUB_TOKEN 通过 `wrangler secret put UPDATE_HUB_TOKEN` 设置
+# DASHBOARD_URL 用于周报通知中的回链地址，留空则自动使用请求域名
+DASHBOARD_URL = ""
+
+# ── Secrets（通过 wrangler secret put 设置，不出现在代码仓库中）──
+# UPDATE_HUB_URL   — Update Hub 地址
+# UPDATE_HUB_TOKEN — Update Hub 认证 Token
+# CRON_SECRET      — GitHub Actions 调用 /api/cron/trigger 的鉴权 Token
