@@ -9,8 +9,8 @@ binding = "WATCHER_STATE"
 id = "c166e000694c4838a79b07fca53d61e2"
 
 # ── Cron Triggers ──
-[triggers]
-crons = ["*/30 * * * *"]
+# 定时检查由 GitHub Actions 驱动（.github/workflows/check.yml）
+# 通过 /api/cron/trigger 端点触发，不在 Cloudflare 侧注册 cron
 
 # Note: All sensitive config (tokens, chat ID, repo list) is now stored in KV
 # via the web dashboard. No need for wrangler secrets for runtime config.
