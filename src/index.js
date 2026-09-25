@@ -36,6 +36,11 @@ export default {
       // API Routes
       if (path === "/api/auth" && method === "POST") {
         const body = await request.json();
+        const isPasswordAttempt = !body.token && !!body.password;
+        const rl = await getRateLimitInfo(request, env);
+        if (isPasswordAttempt && rl.blocked) {
+          return jsonResponse({ error: "Too many failed attempts, try again later" }, corsHeaders, 429);
+        }
         let ok = false;
         if (!config.authPassword) {
           ok = true;
@@ -48,8 +53,10 @@ export default {
             const b = new TextEncoder().encode(config.authPassword);
             ok = a.length === b.length && crypto.subtle.timingSafeEqual(a, b);
           } catch { ok = false; }
+          if (!ok && body.password) await recordAuthFailure(request, env);
         }
         if (ok && config.authPassword) {
+          await clearAuthFailures(request, env);
           const token = body.token || Array.from(crypto.getRandomValues(new Uint8Array(32))).map(b => b.toString(16).padStart(2,'0')).join('');
           if (!body.token) await env.WATCHER_STATE.put("session:" + token, "valid", { expirationTtl: 604800 });
           return jsonResponse({ authenticated: true, token }, corsHeaders);
@@ -63,14 +70,28 @@ export default {
           if (!body.currentPassword) {
             return jsonResponse({ error: "Current password required" }, corsHeaders, 403);
           }
+          const rl = await getRateLimitInfo(request, env);
+          if (rl.blocked) {
+            return jsonResponse({ error: "Too many failed attempts, try again later" }, corsHeaders, 429);
+          }
           const a = new TextEncoder().encode(body.currentPassword);
           const b = new TextEncoder().encode(config.authPassword);
           if (a.length !== b.length || !crypto.subtle.timingSafeEqual(a, b)) {
+            await recordAuthFailure(request, env);
             return jsonResponse({ error: "Current password incorrect" }, corsHeaders, 403);
           }
+          await clearAuthFailures(request, env);
         }
         config.authPassword = body.password || "";
         await env.WATCHER_STATE.put("config", JSON.stringify(config));
+        return jsonResponse({ success: true }, corsHeaders);
+      }
+      if (path === "/api/auth/logout" && method === "POST") {
+        const auth = request.headers.get("Authorization") || "";
+        const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+        if (token.length === 64 && /^[0-9a-f]+$/.test(token)) {
+          await env.WATCHER_STATE.delete("session:" + token);
+        }
         return jsonResponse({ success: true }, corsHeaders);
       }
       if (path === "/api/config" && method === "GET") {
@@ -142,8 +163,11 @@ export default {
         if (!secret) {
           return jsonResponse({ error: "CRON_SECRET not configured" }, corsHeaders, 503);
         }
-        const authHeader = request.headers.get("Authorization");
-        if (!authHeader || authHeader !== "Bearer " + secret) {
+        const authHeader = request.headers.get("Authorization") || "";
+        const provided = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+        const provEnc = new TextEncoder().encode(provided);
+        const secEnc = new TextEncoder().encode(String(secret));
+        if (!provided || provEnc.length !== secEnc.length || !crypto.subtle.timingSafeEqual(provEnc, secEnc)) {
           return jsonResponse({ error: "Unauthorized" }, corsHeaders, 401);
         }
         const result = await checkAllRepos(env);
@@ -152,6 +176,10 @@ export default {
 
       // RSS feed
       if (path === "/rss" || path === "/rss.xml") {
+        // RSS exposes notification history: require the access password/session token when set
+        if (config.authPassword && !await checkToken(url.searchParams.get("token"), config, env)) {
+          return jsonResponse({ error: "Unauthorized" }, corsHeaders, 401);
+        }
         const history = (await env.WATCHER_STATE.get("history", { type: "json" })) || [];
         const baseUrl = url.origin;
         return new Response(generateRSS(history, baseUrl), {
@@ -185,22 +213,48 @@ async function getConfig(env) {
   return config;
 }
 
+// A masked value round-trip ("••••") means "keep existing"; empty clears; anything else replaces.
+function resolveSecret(incoming, existing) {
+  if (incoming === undefined) return existing;
+  if (typeof incoming === "string" && incoming.includes("••••") && existing) return existing;
+  return incoming;
+}
+
+// Re-validate/normalize watchRepos on every write path (not just addRepo).
+function sanitizeWatchRepos(list) {
+  if (!Array.isArray(list)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const item of list) {
+    const raw = typeof item === "string" ? item : item && item.repo;
+    const parsed = parseRepoInput(String(raw || ""));
+    if (!parsed || seen.has(parsed)) continue;
+    seen.add(parsed);
+    if (typeof item === "string") {
+      out.push({ repo: parsed, watch: normalizeWatch() });
+    } else {
+      out.push({ ...item, repo: parsed, watch: normalizeWatch(item.watch) });
+    }
+  }
+  return out;
+}
+
 async function saveConfig(body, env, existingConfig) {
   const existing = existingConfig || await getConfig(env);
   const config = {
-    telegramBotToken: body.telegramBotToken !== undefined ? body.telegramBotToken : existing.telegramBotToken,
+    telegramBotToken: resolveSecret(body.telegramBotToken, existing.telegramBotToken),
     telegramChatId: body.telegramChatId !== undefined ? body.telegramChatId : existing.telegramChatId,
-    githubToken: "githubToken" in body ? body.githubToken : existing.githubToken,
-    watchRepos: body.watchRepos !== undefined ? body.watchRepos : existing.watchRepos,
+    githubToken: resolveSecret(body.githubToken, existing.githubToken),
+    watchRepos: body.watchRepos !== undefined ? sanitizeWatchRepos(body.watchRepos) : existing.watchRepos,
     authPassword: body.authPassword !== undefined ? body.authPassword : existing.authPassword,
     // Notification channels
-    notifyDiscord: body.notifyDiscord !== undefined ? body.notifyDiscord : existing.notifyDiscord,
-    notifyWebhook: body.notifyWebhook !== undefined ? body.notifyWebhook : existing.notifyWebhook,
+    notifyDiscord: resolveSecret(body.notifyDiscord, existing.notifyDiscord),
+    notifyWebhook: resolveSecret(body.notifyWebhook, existing.notifyWebhook),
     // Filters
     filters: body.filters !== undefined ? body.filters : (existing.filters || {}),
     // Keyword alerts
     keywordAlerts: body.keywordAlerts !== undefined ? body.keywordAlerts : (existing.keywordAlerts || []),
-    notifySlack: body.notifySlack !== undefined ? body.notifySlack : (existing.notifySlack || ""),
+    notifySlack: resolveSecret(body.notifySlack, existing.notifySlack || ""),
     // Star milestones
     starMilestones: body.starMilestones !== undefined ? body.starMilestones : (existing.starMilestones || [100, 500, 1000]),
     // Weekly summary
@@ -367,24 +421,38 @@ function maskConfigTokens(config) {
     telegramChatId: config.telegramChatId,
     githubToken: mask(config.githubToken),
     watchRepos: config.watchRepos,
-    notifyDiscord: config.notifyDiscord || "",
-    notifyWebhook: config.notifyWebhook || "",
+    notifyDiscord: mask(config.notifyDiscord) || "",
+    notifyWebhook: mask(config.notifyWebhook) || "", 
     filters: config.filters || {},
     keywordAlerts: config.keywordAlerts || [],
-    notifySlack: config.notifySlack || "",
+    notifySlack: mask(config.notifySlack) || "",
     starMilestones: config.starMilestones || [100, 500, 1000],
     weeklySummary: config.weeklySummary || false,
     updatedAt: config.updatedAt,
   };
 }
 
-async function checkAuth(request, config, env) {
-  if (!config.authPassword) return true;
-  const auth = request.headers.get("Authorization");
-  if (!auth) return false;
-  const parts = auth.split(" ");
-  if (parts.length !== 2 || parts[0] !== "Bearer") return false;
-  const token = parts[1];
+function getClientKey(request) {
+  return request.headers.get("CF-Connecting-IP") || "global";
+}
+
+async function getRateLimitInfo(request, env) {
+  const key = "rl:fail:" + getClientKey(request);
+  const count = parseInt(await env.WATCHER_STATE.get(key) || "0", 10);
+  return { key, count, blocked: count >= 5 };
+}
+
+async function recordAuthFailure(request, env) {
+  const { key, count } = await getRateLimitInfo(request, env);
+  await env.WATCHER_STATE.put(key, String(count + 1), { expirationTtl: 900 });
+}
+
+async function clearAuthFailures(request, env) {
+  await env.WATCHER_STATE.delete("rl:fail:" + getClientKey(request));
+}
+
+async function checkToken(token, config, env) {
+  if (!token) return false;
   // Try session token first (64-char hex)
   if (token.length === 64 && /^[0-9a-f]+$/.test(token)) {
     const stored = await env.WATCHER_STATE.get("session:" + token);
@@ -399,6 +467,26 @@ async function checkAuth(request, config, env) {
   } catch {
     return false;
   }
+}
+
+async function checkAuth(request, config, env) {
+  if (!config.authPassword) return true;
+  const auth = request.headers.get("Authorization");
+  if (!auth) return false;
+  const parts = auth.split(" ");
+  if (parts.length !== 2 || parts[0] !== "Bearer") return false;
+  const token = parts[1];
+  // Valid session tokens are always allowed; rate limiting only guards password guessing
+  if (token.length === 64 && /^[0-9a-f]+$/.test(token)) {
+    const stored = await env.WATCHER_STATE.get("session:" + token);
+    if (stored === "valid") return true;
+  }
+  const rl = await getRateLimitInfo(request, env);
+  if (rl.blocked) return false;
+  const ok = await checkToken(token, config, env);
+  // Count brute-force attempts that use the password as a bearer token
+  if (!ok && !/^[0-9a-f]{64}$/.test(token)) await recordAuthFailure(request, env);
+  return ok;
 }
 
 // ── Test Telegram ──
@@ -703,6 +791,7 @@ async function checkCommits(repo, config, env, filters) {
 
   if (newCommits.length === 0) return 0;
 
+  let notified = 0;
   if (newCommits.length === 1) {
     const c = newCommits[0];
     const msg = c.commit.message.split("\n")[0];
@@ -732,6 +821,7 @@ async function checkCommits(repo, config, env, filters) {
       diff_url: c.html_url,
       extra: { author, sha: shortSha },
     });
+    notified = 1;
   } else {
     // Filter: apply ignoreAuthors and commitKeyword to each commit
     const filtered = newCommits.filter(c => {
@@ -769,9 +859,10 @@ async function checkCommits(repo, config, env, filters) {
       diff_url: compareUrl,
       extra: { count: filtered.length },
     });
+    notified = 1;
   }
 
-  return newCommits.length;
+  return notified;
 }
 
 async function checkActions(repo, config, env, filters) {
@@ -1136,7 +1227,9 @@ async function githubAPI(path, config) {
   const res = await fetch(`https://api.github.com${path}`, { headers });
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`GitHub API ${res.status}: ${text}`);
+    // Keep raw upstream response out of client-visible error messages
+    console.error(`GitHub API ${res.status} ${path}: ${text}`);
+    throw new Error(`GitHub API ${res.status}`);
   }
   return res.json();
 }
@@ -1200,7 +1293,7 @@ async function sendNotification(text, config, priority) {
       await fetch(config.notifyWebhook, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: fullText, raw: fullText.replace(/<[^>]*>/g, ''), priority: p }),
+        body: JSON.stringify({ text: fullText, raw: fullText.replace(/<[^>]*>/g, ''), priority: priority || 'normal' }),
       });
     } catch (e) { console.error('Webhook notify failed:', e.message); }
   }
@@ -1282,10 +1375,12 @@ function escapeXML(str) {
 // ── Utilities ──
 
 function escapeHTML(str) {
+  str = str == null ? "" : String(str);
   return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 function truncate(str, max) {
+  str = str == null ? "" : String(str);
   return str.length > max ? str.slice(0, max - 1) + "…" : str;
 }
 
@@ -2252,13 +2347,12 @@ function getHTML() {
       const config = await fetchAPI('/api/config');
       const tokenInput = document.getElementById('telegram-token');
       const ghInput = document.getElementById('github-token');
-      tokenInput.value = '';
-      tokenInput.placeholder = config.telegramBotToken ? config.telegramBotToken : '从 @BotFather 获取';
-      tokenInput.dataset.hasValue = config.telegramBotToken ? '1' : '0';
+      // Masked values round-trip unchanged (server keeps existing); clearing a field removes the value
+      tokenInput.value = config.telegramBotToken || '';
+      tokenInput.placeholder = '从 @BotFather 获取';
       document.getElementById('telegram-chat-id').value = config.telegramChatId || '';
-      ghInput.value = '';
-      ghInput.placeholder = config.githubToken ? config.githubToken : '提升 API 速率限制';
-      ghInput.dataset.hasValue = config.githubToken ? '1' : '0';
+      ghInput.value = config.githubToken || '';
+      ghInput.placeholder = '提升 API 速率限制';
       // Discord & Webhook
       document.getElementById('discord-webhook').value = config.notifyDiscord || '';
       document.getElementById('custom-webhook').value = config.notifyWebhook || '';
@@ -2286,14 +2380,12 @@ function getHTML() {
         const ghVal = document.getElementById('github-token').value.trim();
         const body = {
           telegramChatId: document.getElementById('telegram-chat-id').value.trim(),
+          telegramBotToken: tokenVal,
           githubToken: ghVal,
           notifyDiscord: document.getElementById('discord-webhook').value.trim(),
           notifySlack: document.getElementById('slack-webhook').value.trim(),
           notifyWebhook: document.getElementById('custom-webhook').value.trim(),
         };
-        if (tokenVal || document.getElementById('telegram-token').dataset.hasValue === '1') {
-          body.telegramBotToken = tokenVal;
-        }
         await fetchAPI('/api/config', { method: 'POST', body: JSON.stringify(body) });
         showToast('设置已保存');
         loadConfig();
@@ -2336,8 +2428,8 @@ function getHTML() {
       }
     }
 
-    function escapeHTML(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
-    function truncate(s, max) { return s.length > max ? s.slice(0, max - 1) + '\u2026' : s; }
+    function escapeHTML(s) { s = s == null ? '' : String(s); return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+    function truncate(s, max) { s = s == null ? '' : String(s); return s.length > max ? s.slice(0, max - 1) + '\u2026' : s; }
 
     function formatTimeAgo(dateStr) {
       if (!dateStr) return '';
@@ -2986,8 +3078,8 @@ function getHTML() {
           showLogin();
         }
       } catch (e) {
-        showApp();
-        initApp();
+        // Fail closed: don't render the dashboard when the auth check itself failed
+        showLogin();
       }
     })();
   </script>
