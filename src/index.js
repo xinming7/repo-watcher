@@ -606,7 +606,7 @@ async function checkRepo(repo, watch, config, env) {
 }
 
 async function checkReleases(repo, config, env, filters) {
-  const data = await githubAPI(`/repos/${repo}/releases?per_page=30`, config);
+  const data = await githubAPI(`/repos/${repo}/releases?per_page=100`, config);
   if (!data || !Array.isArray(data) || data.length === 0) return 0;
 
   const kvKey = `release:${repo}`;
@@ -622,9 +622,17 @@ async function checkReleases(repo, config, env, filters) {
   const newReleases = data.filter((r) => r.id > lastIdNum);
   if (newReleases.length === 0) return 0;
 
+  // Always update state to the newest release ID to prevent re-notifying
   await env.WATCHER_STATE.put(kvKey, String(data[0].id));
 
+  // Only notify for releases published within the last 24 hours
+  // to avoid flooding with old releases when state is stale
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+
   for (const release of newReleases.reverse()) {
+    // Skip releases older than 24 hours (state was stale, not truly new)
+    if (new Date(release.published_at).getTime() < cutoff) continue;
+
     const tag = release.tag_name || "unknown";
     const name = release.name || tag;
     const url = release.html_url;
