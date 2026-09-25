@@ -485,21 +485,31 @@ async function getReposActivity(config, env) {
 async function getStarsHistory(config, env) {
   const repos = config.watchRepos || [];
   if (repos.length === 0) return { stars: [] };
+  // Reuse compare_cache to avoid duplicate /repos/{repo} API calls
+  let repoDataMap = {};
+  const cached = await env.WATCHER_STATE.get("compare_cache", { type: "json" });
+  if (cached && cached.data && cached.ts && (Date.now() - cached.ts < 300000)) {
+    (cached.data.repos || []).forEach(r => { repoDataMap[r.repo] = r; });
+  }
   const results = [];
   for (const entry of repos.slice(0, 20)) {
     const repoName = typeof entry === "string" ? entry : entry.repo;
     try {
-      const repoData = await githubAPI(`/repos/${repoName}`, config);
+      let stars = 0;
+      if (repoDataMap[repoName]) {
+        stars = repoDataMap[repoName].stars;
+      } else {
+        const repoData = await githubAPI(`/repos/${repoName}`, config);
+        stars = repoData.stargazers_count;
+      }
       const kvKey = `stars:${repoName}`;
       const history = (await env.WATCHER_STATE.get(kvKey, { type: "json" })) || [];
-      const current = { stars: repoData.stargazers_count, date: new Date().toISOString().slice(0, 10) };
-      // Only add if date changed or first entry
+      const current = { stars, date: new Date().toISOString().slice(0, 10) };
       if (history.length === 0 || history[history.length - 1].date !== current.date) {
         history.push(current);
-        // Keep last 90 entries
         await env.WATCHER_STATE.put(kvKey, JSON.stringify(history.slice(-90)));
       }
-      results.push({ repo: repoName, stars: repoData.stargazers_count, history: history.slice(-30) });
+      results.push({ repo: repoName, stars, history: history.slice(-30) });
     } catch (e) { /* ignore */ }
   }
   return { stars: results };
@@ -606,7 +616,7 @@ async function checkRepo(repo, watch, config, env) {
 }
 
 async function checkReleases(repo, config, env, filters) {
-  const data = await githubAPI(`/repos/${repo}/releases?per_page=100`, config);
+  const data = await githubAPI(`/repos/${repo}/releases?per_page=5`, config);
   if (!data || !Array.isArray(data) || data.length === 0) return 0;
 
   const kvKey = `release:${repo}`;
@@ -2936,7 +2946,7 @@ function getHTML() {
     }
     // Init
     async function initApp() {
-      await Promise.all([loadStatus(), loadConfig(), loadRepos(), loadHistory(), loadStars(), loadCompare(), loadSummary()]);
+      await Promise.all([loadStatus(), loadConfig(), loadRepos(), loadHistory(), loadCompare(), loadSummary()]);
     }
 
     (async function init() {
