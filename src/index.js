@@ -792,7 +792,11 @@ async function checkActions(repo, config, env, filters) {
 
   await env.WATCHER_STATE.put(kvKey, String(data.workflow_runs[0].id));
 
+  let notified = 0;
   for (const run of newRuns.reverse()) {
+    // Filter: only failures
+    if (filters.actionsOnlyFailures && run.conclusion === 'success') continue;
+
     const name = run.name || "workflow";
     const status = run.conclusion === "success" ? "✅" : run.conclusion === "failure" ? "❌" : "⚠️";
     const branch = run.head_branch || "";
@@ -807,8 +811,6 @@ async function checkActions(repo, config, env, filters) {
       `#GitHub仓库更新 #Actions\n` +
       `<a href="${run.html_url}">View on GitHub →</a>`;
 
-    // Filter: only failures
-    if (filters.actionsOnlyFailures && run.conclusion === 'success') continue;
     await sendNotification(message, config);
     await addHistoryEntry({ type: "action", repo, name, conclusion: run.conclusion, url: run.html_url }, env);
     await reportToUpdateHub(env, {
@@ -818,9 +820,10 @@ async function checkActions(repo, config, env, filters) {
       diff_url: run.html_url,
       extra: { conclusion: run.conclusion, branch: run.head_branch },
     });
+    notified++;
   }
 
-  return newRuns.length;
+  return notified;
 }
 
 
@@ -843,11 +846,13 @@ async function checkIssues(repo, config, env, filters) {
 
   await env.WATCHER_STATE.put(kvKey, String(data[0].id));
 
+  let notified = 0;
   for (const issue of newIssues.reverse()) {
     const title = issue.title || "untitled";
     const labels = (issue.labels || []).map(l => l.name);
     // Filter: ignore labels
     if (filters.ignoreLabels && filters.ignoreLabels.some(l => labels.includes(l))) continue;
+
     const message =
       `🆕 <b>New Issue</b>\n` +
       `<b>${escapeHTML(repo)}</b>\n` +
@@ -858,9 +863,10 @@ async function checkIssues(repo, config, env, filters) {
 
     await sendNotification(message, config);
     await addHistoryEntry({ type: "issue", repo, number: issue.number, title, url: issue.html_url }, env);
+    notified++;
   }
 
-  return newIssues.length;
+  return notified;
 }
 
 async function checkPRs(repo, config, env, filters) {
