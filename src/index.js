@@ -601,7 +601,7 @@ async function checkRepo(repo, watch, config, env) {
 }
 
 async function checkReleases(repo, config, env, filters) {
-  const data = await githubAPI(`/repos/${repo}/releases?per_page=5`, config);
+  const data = await githubAPI(`/repos/${repo}/releases?per_page=30`, config);
   if (!data || !Array.isArray(data) || data.length === 0) return 0;
 
   const kvKey = `release:${repo}`;
