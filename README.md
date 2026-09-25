@@ -27,7 +27,7 @@
 ## 功能
 
 ### 监控类型
-- ✅ **Release** — 新版本发布（含 Pre-release 标记）
+- ✅ **Release** — 新版本发布（支持 per-repo 级别跳过 Pre-release）
 - ✅ **Commit** — 新提交推送（单条/多条自动合并通知）
 - ✅ **Actions** — CI/CD 运行结果（可选仅通知失败）
 - ✅ **Issue** — 新 Issue 创建（可按 label 过滤）
@@ -46,25 +46,49 @@
 ### Dashboard 功能
 - ✅ 运行状态面板（仓库数、通知数、API 配额、最后检查时间）
 - ✅ Telegram / Discord / Slack / Webhook 配置
-- ✅ 仓库管理（添加/删除/置顶/排序/监控项开关）
+- ✅ 仓库管理（添加/删除/置顶/排序/监控项开关/**批量操作**）
+- ✅ **仓库搜索**：按名称快速筛选
 - ✅ ⭐ 从 GitHub Star 列表批量导入仓库
 - ✅ 通知设置（Star 里程碑阈值、周报摘要开关）
-- ✅ 关键词告警规则管理
-- ✅ 通知历史记录（支持清空）
+- ✅ 关键词告警规则管理（仓库名自动补全已监控仓库）
+- ✅ 通知历史记录（**类型筛选 / 关键词搜索 / 分页加载**，支持清空）
 - ✅ 仓库对比（Stars / Forks / Issues / 语言 / 创建时间）
+- ✅ ⭐ Stars 趋势（**SVG 多系列折线图 + 图例**）
 - ✅ 周报摘要（每周一自动推送）
+- ✅ **配置备份**：导出/导入配置（JSON 格式，不含密钥）
 - ✅ 深色 / 浅色 / 跟随系统 主题切换
-- ✅ 折叠展开动画
+- ✅ **自动刷新**：每 60 秒刷新状态和历史，标签页不可见时暂停
 - ✅ 访问密码保护（timingSafeEqual 防时序攻击）
+- ✅ **登录限流**：per-IP 5 次失败 / 15 分钟锁定
+- ✅ **Session 登出**：`POST /api/auth/logout` 撤销 session
 - ✅ GitHub API 配额查看
+- ✅ **移动端适配**：响应式布局、表格横向滚动
 
 ### 过滤器
-- ✅ 忽略 Pre-release
+- ✅ 全局忽略 Pre-release
+- ✅ **Per-repo Pre-release 开关**：每个仓库独立的 `🚫 Pre` 按钮
 - ✅ Actions 仅通知失败
 - ✅ 忽略指定作者的 Commit
 - ✅ 忽略指定 Label 的 Issue
 - ✅ Release Tag 关键词过滤
 - ✅ Commit 关键词过滤
+
+### 批量操作
+- ✅ 全选 / 反选
+- ✅ 批量开启 / 关闭指定监控项
+- ✅ 批量删除仓库
+
+## 安全特性
+
+- ✅ 访问密码使用 `timingSafeEqual` 防时序攻击
+- ✅ 登录 per-IP 限流（5 次失败 / 15 分钟锁定）
+- ✅ Cron Secret 使用 `timingSafeEqual` 比较
+- ✅ RSS 订阅源需要 token 鉴权（设置了密码时）
+- ✅ 配置返回时 Token/Webhook URL 掩码处理
+- ✅ 导入配置时自动清除掩码占位符
+- ✅ GitHub API 错误信息脱敏（不暴露上游错误详情）
+- ✅ `escapeHTML` / `truncate` 防 null 输入
+- ✅ 仓库名通过 `parseRepoInput` 验证（防路径注入）
 
 ## 部署步骤
 
@@ -100,7 +124,7 @@ npx wrangler kv:namespace create WATCHER_STATE
 |--------|------|----------|
 | `CLOUDFLARE_API_TOKEN` | CF 部署 Token | https://dash.cloudflare.com/profile/api-tokens → Edit Cloudflare Workers 模板 |
 | `CLOUDFLARE_ACCOUNT_ID` | CF 账户 ID | `npx wrangler whoami` 或 Dashboard 右侧栏 |
-| `CRON_SECRET` | 定时触发鉴权 | 自定义随机字符串，需与 Worker KV 中的 `CRON_SECRET` 一致 |
+| `CRON_SECRET` | 定时触发鉴权 | 自定义随机字符串，需与 Worker 的 CRON_SECRET secret 一致 |
 
 ### 4. 部署
 
@@ -116,19 +140,23 @@ git push origin main
 npx wrangler deploy
 ```
 
-### 5. 设置 CRON_SECRET
+### 5. 设置 Cloudflare Secrets
 
-首次部署后，通过 Dashboard 或 API 设置 `CRON_SECRET`：
+首次部署后，通过 `wrangler secret put` 设置敏感配置：
 
 ```bash
-# 通过 API 设置（需先在 Dashboard 中设置访问密码）
-curl -X POST https://<your-worker-url>/api/config \
-  -H "Authorization: Bearer <session-token>" \
-  -H "Content-Type: application/json" \
-  -d '{"cronSecret": "your-random-secret"}'
-```
+# Update Hub 地址（可选）
+echo "https://<your-update-hub-url>" | npx wrangler secret put UPDATE_HUB_URL
 
-GitHub Actions 的 `check.yml` 会使用同一个 secret 调用 `/api/cron/trigger`。
+# Update Hub Token（可选）
+echo "<your-token>" | npx wrangler secret put UPDATE_HUB_TOKEN
+
+# 定时触发鉴权
+echo "<your-random-secret>" | npx wrangler secret put CRON_SECRET
+
+# Dashboard 回链地址（周报通知中的链接）
+echo "https://<your-custom-domain>" | npx wrangler secret put DASHBOARD_URL
+```
 
 ### 6. 配置自定义域名（可选）
 
@@ -145,6 +173,8 @@ npx wrangler custom-domain add <your-custom-domain>
 3. **测试连接**：点击「测试 Telegram」确认配置正确
 4. **手动检查**：点击「立即检查」触发首次扫描
 
+所有敏感配置自动保存到 KV，密钥在 API 返回时自动掩码。
+
 ## API 端点
 
 | 方法 | 路径 | 说明 | 鉴权 |
@@ -155,11 +185,10 @@ npx wrangler custom-domain add <your-custom-domain>
 | POST | `/api/config` | 保存配置 | 是 |
 | GET | `/api/repos` | 仓库列表 | 是 |
 | POST | `/api/repos` | 添加仓库 | 是 |
-| PUT | `/api/repos/{owner/repo}` | 更新仓库设置 | 是 |
+| PUT | `/api/repos/{owner/repo}` | 更新仓库设置（含 per-repo 选项） | 是 |
 | DELETE | `/api/repos/{owner/repo}` | 删除仓库 | 是 |
 | GET | `/api/history` | 通知历史 | 是 |
 | DELETE | `/api/history` | 清空通知历史 | 是 |
-| GET | `/api/status` | 运行状态 | 是 |
 | POST | `/api/check` | 手动触发检查 | 是 |
 | POST | `/api/test-telegram` | 测试 Telegram | 是 |
 | GET | `/api/github/starred` | 获取 Star 列表 | 是 |
@@ -169,12 +198,13 @@ npx wrangler custom-domain add <your-custom-domain>
 | GET | `/api/quota` | GitHub API 配额 | 是 |
 | POST | `/api/auth` | 登录验证 | 否 |
 | POST | `/api/auth/password` | 设置/修改密码 | 否 |
-| POST | `/api/cron/trigger` | 定时触发检查 | Bearer Token |
-| GET | `/rss` | RSS 订阅源 | 否 |
+| POST | `/api/auth/logout` | 撤销 session | 是 |
+| POST | `/api/cron/trigger` | 定时触发检查 | Bearer Token（timingSafeEqual） |
+| GET | `/rss` | RSS 订阅源 | Token 参数（设置了密码时） |
 
 ## 通知样式
 
-### Release（带 hashtag）
+### Release
 ```
 🏷️ New Release
 MetaCubeX/mihomo
@@ -216,12 +246,23 @@ abc1234 fix: patch CVE-2026-xxxx
 View on GitHub →
 ```
 
+### Star 里程碑
+```
+⭐ Star Milestone!
+MetaCubeX/mihomo
+Reached 500 stars!
+Milestone: 500
+#GitHub仓库更新 #Star
+View on GitHub →
+```
+
 ## 定时检查机制
 
 - **触发方式**：GitHub Actions `check.yml`，每 30 分钟调用 `/api/cron/trigger`
 - **防重复**：KV 存储每个仓库的最后检查 ID，只通知新增内容
 - **防旧通知**：Release 检查有 24 小时发布时间过滤，超过 24 小时的旧 Release 不会通知
 - **首次静默**：首次添加仓库时记录当前状态，不发送历史通知
+- **自动刷新**：Dashboard 每 60 秒自动刷新状态和历史（标签页不可见时暂停）
 
 ## 项目结构
 
@@ -233,9 +274,18 @@ github-repo-watcher/
 ├── src/
 │   └── index.js           # Worker 主逻辑（后端 API + 前端 Dashboard HTML）
 ├── package.json
-├── wrangler.toml          # Cloudflare Worker 配置
+├── wrangler.toml          # Cloudflare Worker 配置（不含敏感信息）
 └── README.md
 ```
+
+### 配置存储
+
+| 位置 | 内容 |
+|------|------|
+| `wrangler.toml [vars]` | `CRON_SCHEDULE`（非敏感） |
+| Cloudflare Secrets | `UPDATE_HUB_URL`、`UPDATE_HUB_TOKEN`、`CRON_SECRET`、`DASHBOARD_URL` |
+| GitHub Actions Secrets | `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`、`CRON_SECRET` |
+| Cloudflare KV | Telegram Token/Chat ID、GitHub Token、Webhook URL、访问密码、仓库列表、通知历史 |
 
 ## License
 
