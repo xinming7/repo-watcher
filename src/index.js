@@ -596,7 +596,12 @@ async function checkRepo(repo, watch, config, env) {
   if (watch.prs) sent += await checkPRs(repo, config, env, filters);
   sent += await checkRepoMeta(repo, watch, config, env);
   if (watch.prReviews) sent += await checkPRMerges(repo, config, env);
-  sent += await checkKeywordAlerts(repo, config, env);
+  // Share commits data with keyword alerts to avoid duplicate API call
+  let sharedCommits = null;
+  if ((watch.commits || (config.keywordAlerts || []).length > 0) && (config.keywordAlerts || []).length > 0) {
+    try { sharedCommits = await githubAPI(`/repos/${repo}/commits?per_page=5`, config); } catch {}
+  }
+  sent += await checkKeywordAlerts(repo, config, env, sharedCommits);
   return sent;
 }
 
@@ -703,8 +708,18 @@ async function checkCommits(repo, config, env, filters) {
       extra: { author, sha: shortSha },
     });
   } else {
-    const lines = newCommits
-      .reverse()
+    // Filter: apply ignoreAuthors and commitKeyword to each commit
+    const filtered = newCommits.filter(c => {
+      const msg = c.commit.message.split("\n")[0];
+      const author = c.commit.author?.name || "unknown";
+      if (filters.ignoreAuthors && filters.ignoreAuthors.some(a => author.toLowerCase().includes(a.toLowerCase()))) return false;
+      if (filters.commitKeyword && !msg.toLowerCase().includes(filters.commitKeyword.toLowerCase())) return false;
+      return true;
+    });
+    if (filtered.length === 0) return 0;
+
+    const reversed = [...filtered].reverse();
+    const lines = reversed
       .map((c) => {
         const msg = c.commit.message.split("\n")[0];
         const sha = c.sha.slice(0, 7);
@@ -712,21 +727,21 @@ async function checkCommits(repo, config, env, filters) {
       })
       .join("\n");
 
-    const compareUrl = `https://github.com/${repo}/compare/${newCommits[newCommits.length - 1].sha.slice(0, 7)}...${newCommits[0].sha.slice(0, 7)}`;
+    const compareUrl = `https://github.com/${repo}/compare/${filtered[filtered.length - 1].sha.slice(0, 7)}...${filtered[0].sha.slice(0, 7)}`;
 
     const message =
-      `📝 <b>${newCommits.length} New Commits</b>\n` +
+      `📝 <b>${filtered.length} New Commits</b>\n` +
       `<b>${escapeHTML(repo)}</b>\n${lines}\n` +
       `<a href="${compareUrl}">View changes →</a>`;
 
     await sendNotification(message, config);
-    await addHistoryEntry({ type: "commits", repo, count: newCommits.length }, env);
+    await addHistoryEntry({ type: "commits", repo, count: filtered.length }, env);
     await reportToUpdateHub(env, {
-      title: `${repo} ${newCommits.length} new commit(s)`,
-      body: newCommits.map(c => c.commit.message.split('\n')[0]).join('\n').slice(0, 500),
+      title: `${repo} ${filtered.length} new commit(s)`,
+      body: filtered.map(c => c.commit.message.split('\n')[0]).join('\n').slice(0, 500),
       status: 'changed',
-      diff_url: `https://github.com/${repo}/compare/${newCommits[newCommits.length - 1].sha.slice(0, 7)}...${newCommits[0].sha.slice(0, 7)}`,
-      extra: { count: newCommits.length },
+      diff_url: compareUrl,
+      extra: { count: filtered.length },
     });
   }
 
@@ -854,15 +869,15 @@ async function checkPRs(repo, config, env, filters) {
   return newPRs.length;
 }
 
-async function checkKeywordAlerts(repo, config, env) {
+async function checkKeywordAlerts(repo, config, env, commitsData) {
   const alerts = config.keywordAlerts || [];
   if (alerts.length === 0) return 0;
 
   const repoAlerts = alerts.filter(a => a.repo === repo || a.repo === '*');
   if (repoAlerts.length === 0) return 0;
 
-  // Check recent commits for keyword matches
-  const commits = await githubAPI(`/repos/${repo}/commits?per_page=5`, config);
+  // Use shared commits data if available, otherwise fetch
+  const commits = commitsData || await githubAPI(`/repos/${repo}/commits?per_page=5`, config);
   if (!commits || !Array.isArray(commits)) return 0;
 
   const kvKey = `kw:${repo}`;
