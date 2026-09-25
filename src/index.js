@@ -609,7 +609,7 @@ async function checkRepo(repo, watch, config, env) {
   if (watch.prReviews) sent += await checkPRMerges(repo, config, env);
   // Share commits data with keyword alerts to avoid duplicate API call
   let sharedCommits = null;
-  if ((watch.commits || (config.keywordAlerts || []).length > 0) && (config.keywordAlerts || []).length > 0) {
+  if ((config.keywordAlerts || []).length > 0) {
     try { sharedCommits = await githubAPI(`/repos/${repo}/commits?per_page=5`, config); } catch {}
   }
   sent += await checkKeywordAlerts(repo, config, env, sharedCommits);
@@ -640,6 +640,7 @@ async function checkReleases(repo, config, env, filters) {
   // to avoid flooding with old releases when state is stale
   const cutoff = Date.now() - 24 * 60 * 60 * 1000;
 
+  let notified = 0;
   for (const release of newReleases.reverse()) {
     // Skip releases older than 24 hours (state was stale, not truly new)
     if (new Date(release.published_at).getTime() < cutoff) continue;
@@ -650,6 +651,11 @@ async function checkReleases(repo, config, env, filters) {
     const isPre = release.prerelease ? " (Pre-release)" : "";
     const date = new Date(release.published_at).toLocaleDateString("zh-CN");
 
+    // Filter: skip pre-release if configured
+    if (filters.ignorePreRelease && release.prerelease) continue;
+    // Filter: tag keyword
+    if (filters.tagKeyword && !tag.toLowerCase().includes(filters.tagKeyword.toLowerCase())) continue;
+
     const message =
       `🏷️ <b>New Release</b>\n` +
       `<b>${escapeHTML(repo)}</b>\n` +
@@ -659,10 +665,6 @@ async function checkReleases(repo, config, env, filters) {
       `#GitHub仓库更新 #Release\n` +
       `<a href="${url}">View on GitHub →</a>`;
 
-    // Filter: skip pre-release if configured
-    if (filters.ignorePreRelease && release.prerelease) continue;
-    // Filter: tag keyword
-    if (filters.tagKeyword && !tag.toLowerCase().includes(filters.tagKeyword.toLowerCase())) continue;
     await sendNotification(message, config);
     await addHistoryEntry({ type: "release", repo, tag, name, url }, env);
     await reportToUpdateHub(env, {
@@ -673,9 +675,10 @@ async function checkReleases(repo, config, env, filters) {
       diff_url: url,
       extra: { prerelease: release.prerelease },
     });
+    notified++;
   }
 
-  return newReleases.length;
+  return notified;
 }
 
 async function checkCommits(repo, config, env, filters) {
@@ -707,6 +710,11 @@ async function checkCommits(repo, config, env, filters) {
     const date = new Date(c.commit.author?.date).toLocaleString("zh-CN");
     const shortSha = c.sha.slice(0, 7);
 
+    // Filter: ignore authors
+    if (filters.ignoreAuthors && filters.ignoreAuthors.some(a => author.toLowerCase().includes(a.toLowerCase()))) { return 0; }
+    // Filter: commit keyword
+    if (filters.commitKeyword && !msg.toLowerCase().includes(filters.commitKeyword.toLowerCase())) { return 0; }
+
     const message =
       `📝 <b>New Commit</b>\n` +
       `<b>${escapeHTML(repo)}</b>\n` +
@@ -715,10 +723,6 @@ async function checkCommits(repo, config, env, filters) {
       `#GitHub仓库更新 #Commit\n` +
       `<a href="${c.html_url}">View on GitHub →</a>`;
 
-    // Filter: ignore authors
-    if (filters.ignoreAuthors && filters.ignoreAuthors.some(a => author.toLowerCase().includes(a.toLowerCase()))) { return 0; }
-    // Filter: commit keyword
-    if (filters.commitKeyword && !msg.toLowerCase().includes(filters.commitKeyword.toLowerCase())) { return 0; }
     await sendNotification(message, config);
     await addHistoryEntry({ type: "commit", repo, sha: shortSha, message: msg, author }, env);
     await reportToUpdateHub(env, {
@@ -931,6 +935,7 @@ async function checkKeywordAlerts(repo, config, env, commitsData) {
           `<b>${escapeHTML(repo)}</b>\n` +
           `Keyword: <code>${escapeHTML(alert.keyword)}</code>\n` +
           `<code>${shortSha}</code> ${escapeHTML(c.commit.message.split("\n")[0])}\n` +
+          `#GitHub仓库更新 #关键词告警\n` +
           `<a href="${c.html_url}">View on GitHub →</a>`;
         await sendNotification(message, config);
         await addHistoryEntry({ type: "keyword", repo, keyword: alert.keyword, sha: shortSha }, env);
@@ -969,6 +974,7 @@ async function checkRepoMeta(repo, watch, config, env) {
           `<b>${escapeHTML(repo)}</b>\n` +
           `Reached <b>${currentStars}</b> stars!\n` +
           `Milestone: ${crossed.map(m => m.toLocaleString()).join(', ')}\n` +
+          `#GitHub仓库更新 #Star\n` +
           `<a href="https://github.com/${repo}">View on GitHub →</a>`;
         await sendNotification(message, config, 'high');
         await addHistoryEntry({ type: "star_milestone", repo, stars: currentStars, milestones: crossed, priority: 'high' }, env);
@@ -992,6 +998,7 @@ async function checkRepoMeta(repo, watch, config, env) {
             `🍴 <b>New Fork${diff > 1 ? 's' : ''}</b>\n` +
             `<b>${escapeHTML(repo)}</b>\n` +
             `Forks: ${lastForks} → <b>${currentForks}</b> (+${diff})\n` +
+            `#GitHub仓库更新 #Fork\n` +
             `<a href="https://github.com/${repo}/network/members">View Forks →</a>`;
           await sendNotification(message, config);
           await addHistoryEntry({ type: "fork", repo, forks: currentForks, diff }, env);
@@ -1033,6 +1040,7 @@ async function checkPRMerges(repo, config, env) {
         `<b>${escapeHTML(repo)}</b>\n` +
         `#${pr.number} ${escapeHTML(pr.title || "untitled")}\n` +
         `By ${escapeHTML(pr.user?.login || "unknown")}\n` +
+        `#GitHub仓库更新 #PRMerge\n` +
         `<a href="${pr.html_url}">View on GitHub →</a>`;
 
       await sendNotification(message, config);
