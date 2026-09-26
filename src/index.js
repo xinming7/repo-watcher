@@ -2048,6 +2048,7 @@ function getHTML() {
           <label><input type="checkbox" id="batch-select-all" onchange="toggleSelectAll(this.checked)"> 全选</label>
           <select id="batch-watch-key">
             <option value="releases">🏷️ Release</option>
+            <option value="ignorePreRelease">🚫 Pre-release</option>
             <option value="commits">📝 Commit</option>
             <option value="actions">⚡ Actions</option>
             <option value="issues">🆕 Issue</option>
@@ -2065,6 +2066,7 @@ function getHTML() {
         </div>
         <div class="add-repo-options">
           <label><input type="checkbox" id="opt-releases" checked> 🏷️ Release</label>
+          <label><input type="checkbox" id="opt-ignore-pre"> 🚫 Pre</label>
           <label><input type="checkbox" id="opt-commits"> 📝 Commit</label>
           <label><input type="checkbox" id="opt-actions"> ⚡ Actions</label>
           <label><input type="checkbox" id="opt-issues"> 🆕 Issue</label>
