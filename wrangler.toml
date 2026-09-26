@@ -7,7 +7,9 @@ compatibility_date = "2024-01-01"
 # 实际 ID 通过 `wrangler kv:namespace create WATCHER_STATE` 生成，每个 Cloudflare 账户不同
 [[kv_namespaces]]
 binding = "WATCHER_STATE"
-id = "c166e000694c4838a79b07fca53d61e2"
+# 真实 namespace id 请放本地 / 私有部署配置，公开仓库用占位符
+# 生成：wrangler kv:namespace create WATCHER_STATE
+id = "<YOUR_KV_NAMESPACE_ID>"
 
 # ── Cron Triggers ──
 # 定时检查由 GitHub Actions 驱动（.github/workflows/check.yml）

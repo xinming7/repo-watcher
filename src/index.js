@@ -29,8 +29,14 @@ export default {
       const isAuthRoute = path === "/api/auth" || path === "/api/auth/password";
       const isCronRoute = path === "/api/cron/trigger";
       const isAPIRoute = path.startsWith("/api/");
-      if (isAPIRoute && !isAuthRoute && !isCronRoute && config.authPassword && !await checkAuth(request, config, env)) {
-        return jsonResponse({ error: "Unauthorized" }, corsHeaders, 401);
+      if (isAPIRoute && !isAuthRoute && !isCronRoute) {
+        // fail-closed：未设置访问密码时只开放密码初始化接口，其余一律拒绝
+        if (!config.authPassword) {
+          return jsonResponse({ error: "Access password not set. POST /api/auth/password to set the initial password first." }, corsHeaders, 401);
+        }
+        if (!await checkAuth(request, config, env)) {
+          return jsonResponse({ error: "Unauthorized" }, corsHeaders, 401);
+        }
       }
 
       // API Routes
@@ -43,15 +49,15 @@ export default {
         }
         let ok = false;
         if (!config.authPassword) {
-          ok = true;
-        } else if (body.token) {
+          // 未设置密码：提示前端进入初始化流程，而不是无条件放行
+          return jsonResponse({ authenticated: false, setupRequired: true }, corsHeaders);
+        }
+        if (body.token) {
           const stored = await env.WATCHER_STATE.get("session:" + body.token);
           ok = stored === "valid";
         } else {
           try {
-            const a = new TextEncoder().encode(body.password || "");
-            const b = new TextEncoder().encode(config.authPassword);
-            ok = a.length === b.length && crypto.subtle.timingSafeEqual(a, b);
+            ok = await constantTimeEquals(body.password || "", config.authPassword);
           } catch { ok = false; }
           if (!ok && body.password) await recordAuthFailure(request, env);
         }
@@ -74,15 +80,16 @@ export default {
           if (rl.blocked) {
             return jsonResponse({ error: "Too many failed attempts, try again later" }, corsHeaders, 429);
           }
-          const a = new TextEncoder().encode(body.currentPassword);
-          const b = new TextEncoder().encode(config.authPassword);
-          if (a.length !== b.length || !crypto.subtle.timingSafeEqual(a, b)) {
+          if (!await constantTimeEquals(body.currentPassword, config.authPassword)) {
             await recordAuthFailure(request, env);
             return jsonResponse({ error: "Current password incorrect" }, corsHeaders, 403);
           }
           await clearAuthFailures(request, env);
         }
-        config.authPassword = body.password || "";
+        if (typeof body.password !== "string" || body.password.length < 8) {
+          return jsonResponse({ error: "Password must be at least 8 characters" }, corsHeaders, 400);
+        }
+        config.authPassword = body.password;
         await env.WATCHER_STATE.put("config", JSON.stringify(config));
         return jsonResponse({ success: true }, corsHeaders);
       }
@@ -189,10 +196,18 @@ export default {
 
       // Serve frontend
       return new Response(getHTML(), {
-        headers: { "Content-Type": "text/html; charset=utf-8" },
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+          // 内联脚本/样式是单文件仪表盘的既有形态，靠转义 + 本 CSP 收敛注入面
+          "Content-Security-Policy": "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+          "X-Content-Type-Options": "nosniff",
+          "Referrer-Policy": "no-referrer",
+        },
       });
     } catch (err) {
-      return jsonResponse({ error: err.message }, corsHeaders, 500);
+      // 细节只进日志，不回给客户端（避免泄漏内部实现）
+      console.error("Request failed:", err);
+      return jsonResponse({ error: "Internal error" }, corsHeaders, 500);
     }
   },
 };
@@ -239,8 +254,23 @@ function sanitizeWatchRepos(list) {
   return out;
 }
 
+// 通知渠道 URL 必须是 https（空值表示清空；掩码值表示保持不变）
+function validateChannelUrl(value) {
+  if (value === undefined || value === null) return { ok: true, value };
+  if (typeof value !== "string") return { ok: false, error: "channel url must be a string" };
+  const v = value.trim();
+  if (v === "" || v.includes("••••")) return { ok: true, value };
+  if (!v.startsWith("https://")) return { ok: false, error: "channel url must be https://" };
+  try { new URL(v); } catch { return { ok: false, error: "invalid channel url" }; }
+  return { ok: true, value: v };
+}
+
 async function saveConfig(body, env, existingConfig) {
   const existing = existingConfig || await getConfig(env);
+  for (const field of ["notifyDiscord", "notifySlack", "notifyWebhook"]) {
+    const check = validateChannelUrl(body[field]);
+    if (!check.ok) return { success: false, error: field + ": " + check.error };
+  }
   const config = {
     telegramBotToken: resolveSecret(body.telegramBotToken, existing.telegramBotToken),
     telegramChatId: body.telegramChatId !== undefined ? body.telegramChatId : existing.telegramChatId,
@@ -461,10 +491,7 @@ async function checkToken(token, config, env) {
   }
   // Fallback: compare as password
   try {
-    const a = new TextEncoder().encode(token);
-    const b = new TextEncoder().encode(config.authPassword);
-    if (a.length !== b.length) return false;
-    return crypto.subtle.timingSafeEqual(a, b);
+    return await constantTimeEquals(token, config.authPassword);
   } catch {
     return false;
   }
@@ -502,6 +529,7 @@ async function testTelegram(env, existingConfig) {
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    signal: AbortSignal.timeout(15000),
     body: JSON.stringify({
       chat_id: config.telegramChatId,
       text: "✅ GitHub Repo Watcher 连接测试成功！",
@@ -623,7 +651,34 @@ async function getStarredRepos(config) {
 
 // ── Main check logic ──
 
+// 检查互斥锁：防止 cron / 手动触发 / Actions 重叠执行导致重复通知
+// （KV 为最终一致存储，这里是 best-effort；严格互斥可换 Durable Object）
+const CHECK_LOCK_TTL_SEC = 600;
+async function acquireCheckLock(env) {
+  const key = "lock:check";
+  const now = Date.now();
+  const cur = await env.WATCHER_STATE.get(key);
+  if (cur && now - Number(cur) < 300000) return false;
+  await env.WATCHER_STATE.put(key, String(now), { expirationTtl: CHECK_LOCK_TTL_SEC });
+  return true;
+}
+
+async function releaseCheckLock(env) {
+  await env.WATCHER_STATE.delete("lock:check");
+}
+
 async function checkAllRepos(env) {
+  if (!await acquireCheckLock(env)) {
+    return { checked: 0, notifications: 0, message: "Another check is already running" };
+  }
+  try {
+    return await doCheckAllRepos(env);
+  } finally {
+    await releaseCheckLock(env);
+  }
+}
+
+async function doCheckAllRepos(env) {
   const config = await getConfig(env);
   const repos = config.watchRepos || [];
 
@@ -1241,23 +1296,39 @@ async function reportToUpdateHub(env, { version, title, body, status, diff_url, 
   const hubUrl = env.UPDATE_HUB_URL;
   const hubToken = env.UPDATE_HUB_TOKEN;
   if (!hubUrl || !hubToken) return;
+  if (!hubUrl.startsWith("https://")) {
+    console.error("UPDATE_HUB_URL must be https:// (token would be sent in plaintext)");
+    return;
+  }
+  const PROJECT = "github-repo-watcher";
+  const headers = {
+    Authorization: "Bearer " + hubToken,
+    "Content-Type": "application/json",
+  };
+  const postUpdate = () => fetch(hubUrl + "/api/projects/" + PROJECT + "/updates", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ version, title, body, status, diff_url, extra }),
+    signal: AbortSignal.timeout(15000),
+  });
   try {
-    const res = await fetch(`${hubUrl}/api/projects/github-repo-watcher/updates`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${hubToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ version, title, body, status, diff_url, extra }),
-    });
-    const result = await res.json();
-    console.log(`Update Hub: ${title} → ${result.recorded ? 'OK' : result.error}`);
+    let res = await postUpdate();
+    if (res.status === 404) {
+      // 项目未注册：自动注册后重试一次，避免上报静默丢失
+      await fetch(hubUrl + "/api/projects", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ name: PROJECT, label: "GitHub Repo Watcher", type: "version", icon: "🐙" }),
+        signal: AbortSignal.timeout(15000),
+      });
+      res = await postUpdate();
+    }
+    const result = await res.json().catch(() => ({}));
+    console.log("Update Hub: " + title + " → " + (result.recorded ? "OK" : result.error || "unknown"));
   } catch (err) {
-    console.error(`Update Hub report failed: ${err.message}`);
+    console.error("Update Hub report failed: " + err.message);
   }
 }
-
-
 
 // ── Multi-channel notification ──
 
@@ -1269,7 +1340,7 @@ async function sendNotification(text, config, priority) {
     await sendTelegram(fullText, config);
   } catch (e) { console.error('Telegram notify failed:', e.message); }
   // Discord webhook
-  if (config.notifyDiscord) {
+  if (config.notifyDiscord && config.notifyDiscord.startsWith('https://')) {
     try {
       await fetch(config.notifyDiscord, {
         method: 'POST',
@@ -1312,6 +1383,7 @@ async function sendTelegram(text, config) {
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    signal: AbortSignal.timeout(15000),
     body: JSON.stringify({
       chat_id: config.telegramChatId,
       text,
@@ -1374,6 +1446,16 @@ function escapeXML(str) {
 }
 
 // ── Utilities ──
+
+/** 恒定时间字符串比较：双方先 SHA-256 对齐长度，再用 timingSafeEqual 比较 */
+async function constantTimeEquals(a, b) {
+  const enc = new TextEncoder();
+  const [ha, hb] = await Promise.all([
+    crypto.subtle.digest("SHA-256", enc.encode(String(a))),
+    crypto.subtle.digest("SHA-256", enc.encode(String(b))),
+  ]);
+  return crypto.subtle.timingSafeEqual(new Uint8Array(ha), new Uint8Array(hb));
+}
 
 function escapeHTML(str) {
   str = str == null ? "" : String(str);
@@ -2374,6 +2456,29 @@ function getHTML() {
           body: JSON.stringify({ password: pw }),
         });
         const data = await r.json();
+        if (data.setupRequired) {
+          // 首次使用：把输入的密码设置为初始访问密码，然后重新登录
+          if (!pw || pw.length < 8) {
+            const el = document.getElementById('login-error');
+            el.textContent = '首次使用请设置至少 8 位的访问密码';
+            el.style.display = 'block';
+            return;
+          }
+          const set = await fetch(API + '/api/auth/password', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ password: pw }),
+          });
+          if (set.ok) {
+            authToken = pw;
+            sessionStorage.setItem('grw_token', authToken);
+            document.getElementById('login-error').style.display = 'none';
+            showApp();
+            initApp();
+            showToast('访问密码已设置，请妥善保存');
+            return;
+          }
+        }
         if (data.authenticated) {
           authToken = data.token || pw;
           sessionStorage.setItem('grw_token', authToken);

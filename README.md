@@ -114,6 +114,8 @@ npx wrangler login
 npx wrangler kv:namespace create WATCHER_STATE
 # 输出示例: { id = "xxxxxxxxxxxx" }
 # 将 id 填入 wrangler.toml 对应位置
+# ⚠️ 公开仓库请勿提交真实 namespace id：本地填好后不要 commit，
+#    或部署时用 `wrangler deploy --var` / 私有配置注入
 ```
 
 ### 3. 配置 GitHub Secrets
@@ -125,6 +127,12 @@ npx wrangler kv:namespace create WATCHER_STATE
 | `CLOUDFLARE_API_TOKEN` | CF 部署 Token | https://dash.cloudflare.com/profile/api-tokens → Edit Cloudflare Workers 模板 |
 | `CLOUDFLARE_ACCOUNT_ID` | CF 账户 ID | `npx wrangler whoami` 或 Dashboard 右侧栏 |
 | `CRON_SECRET` | 定时触发鉴权 | 自定义随机字符串，需与 Worker 的 CRON_SECRET secret 一致 |
+
+同时在 **Actions → Variables** 中添加：
+
+| Variable | 说明 |
+|----------|------|
+| `WORKER_URL` | Worker 对外地址（如 `https://xxx.workers.dev` 或自定义域名），定时检查用；不写进仓库，避免硬编码个人域名 |
 
 ### 4. 部署
 
@@ -163,6 +171,14 @@ echo "https://<your-custom-domain>" | npx wrangler secret put DASHBOARD_URL
 ```bash
 npx wrangler custom-domain add <your-custom-domain>
 ```
+
+### 安全须知
+
+- **fail-closed**：未设置访问密码时，除 `/api/auth/password`（初始化密码）外所有 API 一律 401。首次访问网页会引导设置初始密码（至少 8 位）。
+- 密码比较使用「先 SHA-256 再 `timingSafeEqual`」的恒定时间比较；登录失败按 IP 限速（5 次 / 15 分钟）。
+- 通知渠道（Discord / Slack / Webhook）只允许 `https://` 地址；所有外发请求带 15s 超时。
+- RSS 需要凭据：`/rss?token=<会话令牌或密码>`。URL 中的凭据会进访问日志，建议使用登录后获得的会话令牌而非密码。
+- 上报 Update Hub 时若项目不存在会自动注册（`github-repo-watcher`），避免数据静默丢失。
 
 ### 7. 通过网页配置
 

@@ -10,8 +10,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Trigger repo check
+        # Worker 地址放在仓库变量 WORKER_URL（Settings -> Secrets and variables -> Actions -> Variables），
+        # 不再把个人域名硬编码进公开仓库
+        env:
+          WORKER_URL: ${{ vars.WORKER_URL }}
         run: |
+          if [ -z "$WORKER_URL" ]; then
+            echo "请先设置仓库变量 WORKER_URL（Worker 对外地址）"
+            exit 1
+          fi
           curl -sf -X POST \
             -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
             -H "Content-Type: application/json" \
-            "https://github-repo-watcher.xinming.dpdns.org/api/cron/trigger" || exit 1
+            "${WORKER_URL%/}/api/cron/trigger" || exit 1
