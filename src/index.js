@@ -1334,7 +1334,7 @@ async function reportToUpdateHub(env, { version, title, body, status, diff_url, 
 
 async function sendNotification(text, config, priority) {
   const prefix = priority === 'high' ? '🔴 ' : '';
-  const fullText = prefix + text + '\n\n#GitHub仓库监控 #更新同步平台';
+  const fullText = prefix + text;
   // Always try Telegram
   try {
     await sendTelegram(fullText, config);
