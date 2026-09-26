@@ -615,16 +615,26 @@ async function getStarsHistory(config, env) {
     (cached.data.repos || []).forEach(r => { repoDataMap[r.repo] = r; });
   }
   const results = [];
+  // Parallel fetch star counts for repos not in cache
+  const uncached = repos.slice(0, 20).filter(entry => {
+    const name = typeof entry === "string" ? entry : entry.repo;
+    return !repoDataMap[name];
+  });
+  const starFetches = await Promise.allSettled(
+    uncached.map(async (entry) => {
+      const name = typeof entry === "string" ? entry : entry.repo;
+      const data = await githubAPI(`/repos/${name}`, config);
+      return { name, stars: data.stargazers_count };
+    })
+  );
+  starFetches.forEach(r => {
+    if (r.status === "fulfilled") repoDataMap[r.value.name] = { stars: r.value.stars };
+  });
+  // Sequential KV reads/writes (KV doesn't support batch)
   for (const entry of repos.slice(0, 20)) {
     const repoName = typeof entry === "string" ? entry : entry.repo;
     try {
-      let stars = 0;
-      if (repoDataMap[repoName]) {
-        stars = repoDataMap[repoName].stars;
-      } else {
-        const repoData = await githubAPI(`/repos/${repoName}`, config);
-        stars = repoData.stargazers_count;
-      }
+      const stars = repoDataMap[repoName]?.stars ?? 0;
       const kvKey = `stars:${repoName}`;
       const history = (await env.WATCHER_STATE.get(kvKey, { type: "json" })) || [];
       const current = { stars, date: new Date().toISOString().slice(0, 10) };
@@ -760,7 +770,9 @@ async function checkRepo(repo, watch, config, env) {
   if (watch.actions) sent += await checkActions(repo, config, env, filters);
   if (watch.issues) sent += await checkIssues(repo, config, env, filters);
   if (watch.prs) sent += await checkPRs(repo, config, env, filters);
-  sent += await checkRepoMeta(repo, watch, config, env);
+  if (watch.forks || (config.starMilestones || []).length > 0) {
+    sent += await checkRepoMeta(repo, watch, config, env);
+  }
   if (watch.prReviews) sent += await checkPRMerges(repo, config, env);
   if ((config.keywordAlerts || []).length > 0) {
     sent += await checkKeywordAlerts(repo, config, env, commitsData);
@@ -1467,7 +1479,7 @@ async function constantTimeEquals(a, b) {
 
 function escapeHTML(str) {
   str = str == null ? "" : String(str);
-  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
 function truncate(str, max) {
@@ -2480,12 +2492,21 @@ function getHTML() {
             body: JSON.stringify({ password: pw }),
           });
           if (set.ok) {
-            authToken = pw;
-            sessionStorage.setItem('grw_token', authToken);
-            document.getElementById('login-error').style.display = 'none';
-            showApp();
-            initApp();
-            showToast('访问密码已设置，请妥善保存');
+            // 获取正式 session token，避免明文密码作为 Bearer Token
+            const loginRes = await fetch(API + '/api/auth', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ password: pw }),
+            });
+            const loginData = await loginRes.json();
+            if (loginData.authenticated) {
+              authToken = loginData.token;
+              sessionStorage.setItem('grw_token', authToken);
+              document.getElementById('login-error').style.display = 'none';
+              showApp();
+              initApp();
+              showToast('访问密码已设置，请妥善保存');
+            }
             return;
           }
         }
@@ -3379,12 +3400,18 @@ function getHTML() {
           if (_compareSort === 'name') return a.repo.localeCompare(b.repo);
           return 0;
         });
-        container.innerHTML = '<div class="sort-bar" style="margin-bottom:8px"><label>排序：</label>' +
-          '<select id="compare-sort" onchange="_compareSort=this.value;loadCompare()" style="padding:6px 10px;background:var(--input-bg);border:1px solid var(--input-border);border-radius:8px;color:var(--text-primary);font-size:13px">' +
-          '<option value="stars-desc">Stars ↓</option><option value="stars-asc">Stars ↑</option>' +
-          '<option value="forks-desc">Forks ↓</option><option value="forks-asc">Forks ↑</option>' +
-          '<option value="issues-desc">Issues ↓</option><option value="issues-asc">Issues ↑</option>' +
-          '<option value="name">名称</option></select></div>' +
+        // Only rebuild sort dropdown if it doesn't exist yet
+        if (!document.getElementById('compare-sort')) {
+          container.innerHTML = '<div class="sort-bar" style="margin-bottom:8px"><label>排序：</label>' +
+            '<select id="compare-sort" onchange="_compareSort=this.value;loadCompare()" style="padding:6px 10px;background:var(--input-bg);border:1px solid var(--input-border);border-radius:8px;color:var(--text-primary);font-size:13px">' +
+            '<option value="stars-desc">Stars ↓</option><option value="stars-asc">Stars ↑</option>' +
+            '<option value="forks-desc">Forks ↓</option><option value="forks-asc">Forks ↑</option>' +
+            '<option value="issues-desc">Issues ↓</option><option value="issues-asc">Issues ↑</option>' +
+            '<option value="name">名称</option></select></div>' +
+            '<div id="compare-table-body"></div>';
+        }
+        document.getElementById('compare-sort').value = _compareSort;
+        document.getElementById('compare-table-body').innerHTML =
           '<table class="compare-table"><thead><tr>' +
           '<th>仓库</th><th>⭐ Stars</th><th>🍴 Forks</th><th>📋 Issues</th><th>👁 Watchers</th><th>🔤 语言</th>' +
           '</tr></thead><tbody>' +
