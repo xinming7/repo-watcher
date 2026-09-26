@@ -410,16 +410,22 @@ async function getStatus(env, existingConfig) {
   const history = (await env.WATCHER_STATE.get("history", { type: "json" })) || [];
   const lastCheck = history.length > 0 ? history[0].timestamp : null;
 
-  // Fetch GitHub API rate limit
+  // Fetch GitHub API rate limit (cached 5 min to avoid wasting API quota)
   let apiQuota = null;
   try {
-    const rateLimit = await githubAPI('/rate_limit', config);
-    if (rateLimit && rateLimit.rate) {
-      apiQuota = {
-        limit: rateLimit.rate.limit,
-        remaining: rateLimit.rate.remaining,
-        reset: new Date(rateLimit.rate.reset * 1000).toISOString(),
-      };
+    const cached = await env.WATCHER_STATE.get("rate_limit_cache", { type: "json" });
+    if (cached && cached.ts && (Date.now() - cached.ts < 300000)) {
+      apiQuota = cached.data;
+    } else {
+      const rateLimit = await githubAPI('/rate_limit', config);
+      if (rateLimit && rateLimit.rate) {
+        apiQuota = {
+          limit: rateLimit.rate.limit,
+          remaining: rateLimit.rate.remaining,
+          reset: new Date(rateLimit.rate.reset * 1000).toISOString(),
+        };
+      }
+      env.WATCHER_STATE.put("rate_limit_cache", JSON.stringify({ data: apiQuota, ts: Date.now() }), { expirationTtl: 600 }).catch(() => {});
     }
   } catch (e) { /* ignore */ }
 
@@ -745,18 +751,20 @@ async function checkRepo(repo, watch, config, env) {
   let sent = 0;
   const filters = config.filters || {};
   if (watch.releases) sent += await checkReleases(repo, config, env, filters, watch);
-  if (watch.commits) sent += await checkCommits(repo, config, env, filters);
+  // Fetch commits once, share between checkCommits and checkKeywordAlerts
+  let commitsData = null;
+  if (watch.commits || (config.keywordAlerts || []).length > 0) {
+    try { commitsData = await githubAPI(`/repos/${repo}/commits?per_page=10`, config); } catch {}
+  }
+  if (watch.commits) sent += await checkCommits(repo, config, env, filters, commitsData);
   if (watch.actions) sent += await checkActions(repo, config, env, filters);
   if (watch.issues) sent += await checkIssues(repo, config, env, filters);
   if (watch.prs) sent += await checkPRs(repo, config, env, filters);
   sent += await checkRepoMeta(repo, watch, config, env);
   if (watch.prReviews) sent += await checkPRMerges(repo, config, env);
-  // Share commits data with keyword alerts to avoid duplicate API call
-  let sharedCommits = null;
   if ((config.keywordAlerts || []).length > 0) {
-    try { sharedCommits = await githubAPI(`/repos/${repo}/commits?per_page=5`, config); } catch {}
+    sent += await checkKeywordAlerts(repo, config, env, commitsData);
   }
-  sent += await checkKeywordAlerts(repo, config, env, sharedCommits);
   return sent;
 }
 
@@ -825,8 +833,8 @@ async function checkReleases(repo, config, env, filters, watch) {
   return notified;
 }
 
-async function checkCommits(repo, config, env, filters) {
-  const data = await githubAPI(`/repos/${repo}/commits?per_page=10`, config);
+async function checkCommits(repo, config, env, filters, preFetchedData) {
+  const data = preFetchedData || await githubAPI(`/repos/${repo}/commits?per_page=10`, config);
   if (!data || !Array.isArray(data) || data.length === 0) return 0;
 
   const kvKey = `commit:${repo}`;
@@ -2919,6 +2927,7 @@ function getHTML() {
       }
       const watch = {
         releases: document.getElementById('opt-releases').checked,
+        ignorePreRelease: document.getElementById('opt-ignore-pre').checked,
         commits: document.getElementById('opt-commits').checked,
         actions: document.getElementById('opt-actions').checked,
         issues: document.getElementById('opt-issues').checked,
@@ -3161,6 +3170,7 @@ function getHTML() {
       if (checked.length === 0) { showToast('请先选择仓库', 'error'); return; }
       const watch = {
         releases: document.getElementById('opt-releases').checked,
+        ignorePreRelease: document.getElementById('opt-ignore-pre').checked,
         commits: document.getElementById('opt-commits').checked,
         actions: document.getElementById('opt-actions').checked,
         issues: document.getElementById('opt-issues').checked,
