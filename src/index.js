@@ -308,7 +308,7 @@ async function getRepos(env, existingConfig) {
 }
 
 function normalizeWatch(w) {
-  if (!w) return { releases: true, commits: true, actions: false, issues: false, prs: false, forks: false, prReviews: false, ignorePreRelease: false };
+    if (!w) return { releases: true, commits: true, actions: false, issues: false, prs: false, forks: false, prReviews: false, trackPreRelease: false };
   return {
     releases: w.releases !== undefined ? w.releases : true,
     commits: w.commits !== undefined ? w.commits : true,
@@ -317,7 +317,7 @@ function normalizeWatch(w) {
     prs: w.prs !== undefined ? w.prs : false,
     forks: w.forks !== undefined ? w.forks : false,
     prReviews: w.prReviews !== undefined ? w.prReviews : false,
-    ignorePreRelease: w.ignorePreRelease !== undefined ? w.ignorePreRelease : false,
+        trackPreRelease: w.trackPreRelease !== undefined ? w.trackPreRelease : false,
   };
 }
 
@@ -815,8 +815,8 @@ async function checkReleases(repo, config, env, filters, watch) {
     const isPre = release.prerelease ? " (Pre-release)" : "";
     const date = new Date(release.published_at).toLocaleDateString("zh-CN");
 
-    // Filter: skip pre-release if configured (global filter OR per-repo setting)
-    if ((filters.ignorePreRelease || (watch && watch.ignorePreRelease)) && release.prerelease) continue;
+    // Filter: skip pre-release if per-repo tracking disabled OR global filter enabled
+    if ((!watch.trackPreRelease || filters.ignorePreRelease) && release.prerelease) continue;
     // Filter: tag keyword
     if (filters.tagKeyword && !tag.toLowerCase().includes(filters.tagKeyword.toLowerCase())) continue;
 
@@ -2068,7 +2068,7 @@ function getHTML() {
           <label><input type="checkbox" id="batch-select-all" onchange="toggleSelectAll(this.checked)"> 全选</label>
           <select id="batch-watch-key">
             <option value="releases">🏷️ Release</option>
-            <option value="ignorePreRelease">🚫 Pre-release</option>
+            <option value="trackPreRelease">🏷️ Pre-release</option>
             <option value="commits">📝 Commit</option>
             <option value="actions">⚡ Actions</option>
             <option value="issues">🆕 Issue</option>
@@ -2086,7 +2086,7 @@ function getHTML() {
         </div>
         <div class="add-repo-options">
           <label><input type="checkbox" id="opt-releases" checked> 🏷️ Release</label>
-          <label><input type="checkbox" id="opt-ignore-pre"> 🚫 Pre</label>
+          <label><input type="checkbox" id="opt-track-pre"> 🏷️ Pre</label>
           <label><input type="checkbox" id="opt-commits"> 📝 Commit</label>
           <label><input type="checkbox" id="opt-actions"> ⚡ Actions</label>
           <label><input type="checkbox" id="opt-issues"> 🆕 Issue</label>
@@ -2779,7 +2779,7 @@ function getHTML() {
             '<span class="repo-name"><a href="https://github.com/' + safe + '" target="_blank">' + safe + '</a></span>' +
             '<span class="repo-toggles">' +
               mkBtn('releases', '🏷️ Release') +
-              mkBtn('ignorePreRelease', '🚫 Pre') +
+              mkBtn('trackPreRelease', '🏷️ Pre') +
               mkBtn('commits', '📝 Commit') +
               mkBtn('actions', '⚡ Actions') +
               mkBtn('issues', '🆕 Issue') +
@@ -2948,7 +2948,7 @@ function getHTML() {
       }
       const watch = {
         releases: document.getElementById('opt-releases').checked,
-        ignorePreRelease: document.getElementById('opt-ignore-pre').checked,
+        trackPreRelease: document.getElementById('opt-track-pre').checked,
         commits: document.getElementById('opt-commits').checked,
         actions: document.getElementById('opt-actions').checked,
         issues: document.getElementById('opt-issues').checked,
@@ -3191,7 +3191,7 @@ function getHTML() {
       if (checked.length === 0) { showToast('请先选择仓库', 'error'); return; }
       const watch = {
         releases: document.getElementById('opt-releases').checked,
-        ignorePreRelease: document.getElementById('opt-ignore-pre').checked,
+        trackPreRelease: document.getElementById('opt-track-pre').checked,
         commits: document.getElementById('opt-commits').checked,
         actions: document.getElementById('opt-actions').checked,
         issues: document.getElementById('opt-issues').checked,
@@ -3222,7 +3222,7 @@ function getHTML() {
       try {
         const body = {
           filters: {
-            ignorePreRelease: document.getElementById('filter-ignore-pre').checked,
+            trackPreRelease: document.getElementById('filter-ignore-pre').checked,
             actionsOnlyFailures: document.getElementById('filter-actions-fail').checked,
             ignoreAuthors: document.getElementById('filter-ignore-authors').value.split(',').map(s => s.trim()).filter(Boolean),
             ignoreLabels: document.getElementById('filter-ignore-labels').value.split(',').map(s => s.trim()).filter(Boolean),
