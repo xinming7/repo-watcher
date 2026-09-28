@@ -566,9 +566,10 @@ async function getReposActivity(config, env) {
       const result = { repo: repoName };
       try {
         if (watch.releases) {
-          const rel = await githubAPI(`/repos/${repoName}/releases?per_page=1`, config);
+          const rel = await githubAPI(`/repos/${repoName}/releases?per_page=5`, config);
           if (rel && Array.isArray(rel) && rel.length > 0) {
-            const r = rel[0];
+            // Skip pre-release unless trackPreRelease is enabled
+            const r = watch.trackPreRelease ? rel[0] : rel.find(re => !re.prerelease) || rel[0];
             result.latestRelease = {
               tag: r.tag_name,
               name: r.name || r.tag_name,
