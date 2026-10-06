@@ -393,14 +393,18 @@ async function getHistory(limit, env) {
 }
 
 async function addHistoryEntry(entry, env) {
-  const history = (await env.WATCHER_STATE.get("history", { type: "json" })) || [];
-  history.unshift({
-    ...entry,
-    timestamp: new Date().toISOString(),
-    priority: entry.priority || 'normal',
-  });
-  // Keep only last 200 entries
-  await env.WATCHER_STATE.put("history", JSON.stringify(history.slice(0, 200)));
+  try {
+    const history = (await env.WATCHER_STATE.get("history", { type: "json" })) || [];
+    history.unshift({
+      ...entry,
+      timestamp: new Date().toISOString(),
+      priority: entry.priority || 'normal',
+    });
+    // Keep only last 200 entries
+    await env.WATCHER_STATE.put("history", JSON.stringify(history.slice(0, 200)));
+  } catch (e) {
+    console.error("addHistoryEntry failed:", e.message);
+  }
 }
 
 // ── Status API ──
@@ -564,25 +568,32 @@ async function getReposActivity(config, env) {
       const repoName = typeof entry === "string" ? entry : entry.repo;
       const watch = typeof entry === "string" ? { releases: true, commits: true } : (entry.watch || {});
       const result = { repo: repoName };
+      // Fetch release and commit in parallel per repo
+      const [relResult, commitResult] = await Promise.allSettled([
+        watch.releases ? githubAPI(`/repos/${repoName}/releases?per_page=5`, config) : null,
+        watch.commits ? githubAPI(`/repos/${repoName}/commits?per_page=1`, config) : null,
+      ]);
       try {
-        if (watch.releases) {
-          const rel = await githubAPI(`/repos/${repoName}/releases?per_page=5`, config);
+        if (watch.releases && relResult.status === "fulfilled") {
+          const rel = relResult.value;
           if (rel && Array.isArray(rel) && rel.length > 0) {
             // Skip pre-release unless trackPreRelease is enabled
-            const r = watch.trackPreRelease ? rel[0] : rel.find(re => !re.prerelease) || rel[0];
-            result.latestRelease = {
-              tag: r.tag_name,
-              name: r.name || r.tag_name,
-              date: r.published_at,
-              url: r.html_url,
-              prerelease: r.prerelease,
-            };
+            const r = watch.trackPreRelease ? rel[0] : rel.find(re => !re.prerelease);
+            if (r) {
+              result.latestRelease = {
+                tag: r.tag_name,
+                name: r.name || r.tag_name,
+                date: r.published_at,
+                url: r.html_url,
+                prerelease: r.prerelease,
+              };
+            }
           }
         }
       } catch (e) { /* ignore */ }
       try {
-        if (watch.commits) {
-          const commits = await githubAPI(`/repos/${repoName}/commits?per_page=1`, config);
+        if (watch.commits && commitResult.status === "fulfilled") {
+          const commits = commitResult.value;
           if (commits && Array.isArray(commits) && commits.length > 0) {
             const c = commits[0];
             result.latestCommit = {
