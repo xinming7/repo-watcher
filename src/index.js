@@ -14,7 +14,7 @@ export default {
 
     // CORS headers
     const corsHeaders = {
-      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Origin": url.origin,
       "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type",
     };
@@ -160,7 +160,22 @@ export default {
       if (path === "/api/quota" && method === "GET") {
         try {
           const rateLimit = await githubAPI('/rate_limit', config);
-          return jsonResponse(rateLimit, corsHeaders);
+          // Only expose safe subset of rate limit info
+          const safe = rateLimit && rateLimit.rate ? {
+            resources: {
+              core: {
+                limit: rateLimit.resources.core.limit,
+                remaining: rateLimit.resources.core.remaining,
+                reset: new Date(rateLimit.resources.core.reset * 1000).toISOString(),
+              },
+              search: {
+                limit: rateLimit.resources.search.limit,
+                remaining: rateLimit.resources.search.remaining,
+                reset: new Date(rateLimit.resources.search.reset * 1000).toISOString(),
+              },
+            },
+          } : {};
+          return jsonResponse(safe, corsHeaders);
         } catch (e) {
           return jsonResponse({ error: e.message }, corsHeaders, 500);
         }
@@ -308,7 +323,7 @@ async function getRepos(env, existingConfig) {
 }
 
 function normalizeWatch(w) {
-    if (!w) return { releases: true, commits: true, actions: false, issues: false, prs: false, forks: false, prReviews: false, trackPreRelease: false };
+    if (!w) return { releases: false, commits: false, actions: false, issues: false, prs: false, forks: false, prReviews: false, trackPreRelease: false };
   return {
     releases: w.releases !== undefined ? w.releases : true,
     commits: w.commits !== undefined ? w.commits : true,
@@ -872,7 +887,13 @@ async function checkCommits(repo, config, env, filters, preFetchedData) {
 
   let newCommits;
   const idx = data.findIndex((c) => c.sha === lastSha);
-  newCommits = idx === -1 ? data.slice(0, 3) : data.slice(0, idx);
+  if (idx === -1) {
+    // lastSha not found (KV cleared / force push): only notify latest, log warning
+    console.warn(`checkCommits: lastSha ${lastSha.slice(0,7)} not found for ${repo}, state may be stale`);
+    newCommits = data.slice(0, 1);
+  } else {
+    newCommits = data.slice(0, idx);
+  }
   if (newCommits.length > 0) {
     await env.WATCHER_STATE.put(kvKey, data[0].sha);
   }
@@ -1102,7 +1123,13 @@ async function checkKeywordAlerts(repo, config, env, commitsData) {
   }
 
   const idx = commits.findIndex(c => c.sha === lastSha);
-  const newCommits = idx === -1 ? commits.slice(0, 3) : commits.slice(0, idx);
+  let newCommits;
+  if (idx === -1) {
+    console.warn(`checkKeywordAlerts: lastSha ${lastSha.slice(0,7)} not found for ${repo}, state may be stale`);
+    newCommits = commits.slice(0, 1);
+  } else {
+    newCommits = commits.slice(0, idx);
+  }
   if (newCommits.length > 0) {
     await env.WATCHER_STATE.put(kvKey, commits[0].sha);
   }
@@ -1266,7 +1293,7 @@ async function getWeeklySummary(config, env) {
 // ── Repos Comparison ──
 
 async function getReposComparison(config, env) {
-  // Check KV cache (5 min TTL)
+  // Check KV cache (5 min TTL) — shared with getStarsHistory
   const cached = await env.WATCHER_STATE.get("compare_cache", { type: "json" });
   if (cached && cached.data && cached.ts && (Date.now() - cached.ts < 300000)) {
     return cached.data;
@@ -1275,12 +1302,12 @@ async function getReposComparison(config, env) {
   const repos = config.watchRepos || [];
   if (repos.length === 0) return { repos: [] };
 
-  const results = [];
-  for (const entry of repos.slice(0, 20)) {
-    const repoName = typeof entry === "string" ? entry : entry.repo;
-    try {
+  // Parallel fetch all repo metadata
+  const fetches = await Promise.allSettled(
+    repos.slice(0, 20).map(async (entry) => {
+      const repoName = typeof entry === "string" ? entry : entry.repo;
       const data = await githubAPI(`/repos/${repoName}`, config);
-      results.push({
+      return {
         repo: repoName,
         stars: data.stargazers_count,
         forks: data.forks_count,
@@ -1289,11 +1316,11 @@ async function getReposComparison(config, env) {
         language: data.language,
         updatedAt: data.updated_at,
         createdAt: data.created_at,
-      });
-    } catch (e) { /* skip */ }
-  }
+      };
+    })
+  );
 
-  const result = { repos: results };
+  const result = { repos: fetches.filter(r => r.status === "fulfilled").map(r => r.value) };
   // Write cache (fire-and-forget)
   env.WATCHER_STATE.put("compare_cache", JSON.stringify({ data: result, ts: Date.now() }), { expirationTtl: 600 }).catch(() => {});
   return result;
@@ -1377,7 +1404,7 @@ async function sendNotification(text, config, priority) {
       await fetch(config.notifyDiscord, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content: fullText.replace(/<[^>]*>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>') }),
+        body: JSON.stringify({ content: fullText.replace(/<[^>]*>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'") }),
       });
     } catch (e) { console.error('Discord notify failed:', e.message); }
   }
@@ -1387,7 +1414,7 @@ async function sendNotification(text, config, priority) {
       await fetch(config.notifySlack, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: fullText.replace(/<[^>]*>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>') }),
+        body: JSON.stringify({ text: fullText.replace(/<[^>]*>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'") }),
       });
     } catch (e) { console.error('Slack notify failed:', e.message); }
   }
