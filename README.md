@@ -27,7 +27,7 @@
 ## 功能
 
 ### 监控类型
-- ✅ **Release** — 新版本发布（支持 per-repo 级别跳过 Pre-release）
+- ✅ **Release** — 新版本发布（per-repo 级别 opt-in Pre-release 追踪）
 - ✅ **Commit** — 新提交推送（单条/多条自动合并通知）
 - ✅ **Actions** — CI/CD 运行结果（可选仅通知失败）
 - ✅ **Issue** — 新 Issue 创建（可按 label 过滤）
@@ -38,7 +38,7 @@
 - ✅ **关键词告警** — Commit 消息匹配关键词时告警
 
 ### 通知渠道
-- ✅ Telegram Bot（HTML 格式，带 `#GitHub仓库更新` 等 hashtag 标签）
+- ✅ Telegram Bot（HTML 格式，带 `#GitHub仓库更新 #项目名 #类型` hashtag 标签）
 - ✅ Discord Webhook
 - ✅ Slack Webhook
 - ✅ 自定义 Webhook
@@ -56,17 +56,18 @@
 - ✅ ⭐ Stars 趋势（**SVG 多系列折线图 + 图例**）
 - ✅ 周报摘要（每周一自动推送）
 - ✅ **配置备份**：导出/导入配置（JSON 格式，不含密钥）
-- ✅ 深色 / 浅色 / 跟随系统 主题切换
+- ✅ 深色 / 浅色 / 跟随系统 主题切换（🌙/💻/☀️ 按钮）
 - ✅ **自动刷新**：每 60 秒刷新状态和历史，标签页不可见时暂停
 - ✅ 访问密码保护（timingSafeEqual 防时序攻击）
 - ✅ **登录限流**：per-IP 5 次失败 / 15 分钟锁定
 - ✅ **Session 登出**：`POST /api/auth/logout` 撤销 session
 - ✅ GitHub API 配额查看
 - ✅ **移动端适配**：响应式布局、表格横向滚动
+- ✅ **GitHub 图标链接**：标题可点击跳转到项目仓库
 
 ### 过滤器
-- ✅ 全局忽略 Pre-release
-- ✅ **Per-repo Pre-release 开关**：每个仓库独立的 `🚫 Pre` 按钮
+- ✅ 全局忽略 Pre-release（`ignorePreRelease`）
+- ✅ **Per-repo Pre-release 开关**：每个仓库独立的 `🏷️ Pre` 按钮（opt-in 模式，默认不追踪）
 - ✅ Actions 仅通知失败
 - ✅ 忽略指定作者的 Commit
 - ✅ 忽略指定 Label 的 Issue
@@ -83,12 +84,14 @@
 - ✅ 访问密码使用 `timingSafeEqual` 防时序攻击
 - ✅ 登录 per-IP 限流（5 次失败 / 15 分钟锁定）
 - ✅ Cron Secret 使用 `timingSafeEqual` 比较
+- ✅ CORS 限制为请求来源域名（`url.origin`）
 - ✅ RSS 订阅源需要 token 鉴权（设置了密码时）
 - ✅ 配置返回时 Token/Webhook URL 掩码处理
 - ✅ 导入配置时自动清除掩码占位符
 - ✅ GitHub API 错误信息脱敏（不暴露上游错误详情）
 - ✅ `escapeHTML` / `truncate` 防 null 输入
 - ✅ 仓库名通过 `parseRepoInput` 验证（防路径注入）
+- ✅ `/api/quota` 只暴露安全的 rate limit 子集
 
 ## 部署步骤
 
@@ -176,6 +179,7 @@ npx wrangler custom-domain add <your-custom-domain>
 
 - **fail-closed**：未设置访问密码时，除 `/api/auth/password`（初始化密码）外所有 API 一律 401。首次访问网页会引导设置初始密码（至少 8 位）。
 - 密码比较使用「先 SHA-256 再 `timingSafeEqual`」的恒定时间比较；登录失败按 IP 限速（5 次 / 15 分钟）。
+- CORS 限制为请求来源域名，防止跨域攻击。
 - 通知渠道（Discord / Slack / Webhook）只允许 `https://` 地址；所有外发请求带 15s 超时。
 - RSS 需要凭据：`/rss?token=<会话令牌或密码>`。URL 中的凭据会进访问日志，建议使用登录后获得的会话令牌而非密码。
 - 上报 Update Hub 时若项目不存在会自动注册（`github-repo-watcher`），避免数据静默丢失。
@@ -211,7 +215,7 @@ npx wrangler custom-domain add <your-custom-domain>
 | GET | `/api/repos/activity` | 仓库最新动态 | 是 |
 | GET | `/api/repos/compare` | 仓库对比数据 | 是 |
 | GET | `/api/summary` | 周报摘要 | 是 |
-| GET | `/api/quota` | GitHub API 配额 | 是 |
+| GET | `/api/quota` | GitHub API 配额（安全子集） | 是 |
 | POST | `/api/auth` | 登录验证 | 否 |
 | POST | `/api/auth/password` | 设置/修改密码 | 否 |
 | POST | `/api/auth/logout` | 撤销 session | 是 |
@@ -227,7 +231,7 @@ MetaCubeX/mihomo
 v1.19.30
 Tag: v1.19.30
 Date: 2026/9/25
-#GitHub仓库更新 #Release
+#GitHub仓库更新 #mihomo #Release
 View on GitHub →
 ```
 
@@ -237,7 +241,7 @@ View on GitHub →
 vercel/next.js
 abc1234 Fix build error
 By octocat · 2026/9/25 10:00:00
-#GitHub仓库更新 #Commit
+#GitHub仓库更新 #next.js #Commit
 View on GitHub →
 ```
 
@@ -248,7 +252,7 @@ vercel/next.js
 • abc1234 Fix build error
 • def5678 Add new feature
 • ghi9012 Update docs
-#GitHub仓库更新 #Commits
+#GitHub仓库更新 #next.js #Commits
 View changes →
 ```
 
@@ -258,7 +262,7 @@ View changes →
 MetaCubeX/mihomo
 Keyword: CVE
 abc1234 fix: patch CVE-2026-xxxx
-#GitHub仓库更新 #关键词告警
+#GitHub仓库更新 #mihomo #关键词告警
 View on GitHub →
 ```
 
@@ -268,7 +272,7 @@ View on GitHub →
 MetaCubeX/mihomo
 Reached 500 stars!
 Milestone: 500
-#GitHub仓库更新 #Star
+#GitHub仓库更新 #mihomo #Star
 View on GitHub →
 ```
 
@@ -301,7 +305,7 @@ github-repo-watcher/
 | `wrangler.toml [vars]` | `CRON_SCHEDULE`（非敏感） |
 | Cloudflare Secrets | `UPDATE_HUB_URL`、`UPDATE_HUB_TOKEN`、`CRON_SECRET`、`DASHBOARD_URL` |
 | GitHub Actions Secrets | `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`、`CRON_SECRET` |
-| Cloudflare KV | Telegram Token/Chat ID、GitHub Token、Webhook URL、访问密码、仓库列表、通知历史 |
+| Cloudflare KV | Telegram Token/Chat ID、GitHub Token、Webhook URL、访问密码、仓库列表、通知历史、各种缓存（activity_cache、compare_cache、stars_history_cache、rate_limit_cache） |
 
 ## License
 
