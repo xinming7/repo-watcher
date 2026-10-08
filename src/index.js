@@ -446,7 +446,7 @@ async function getStatus(env, existingConfig) {
       }
       env.WATCHER_STATE.put("rate_limit_cache", JSON.stringify({ data: apiQuota, ts: Date.now() }), { expirationTtl: 600 }).catch(() => {});
     }
-  } catch (e) { /* ignore */ }
+  } catch (e) { console.error("getStatus rate_limit:", e.message); }
 
   const channels = [];
   if (config.telegramBotToken && config.telegramChatId) channels.push('Telegram');
@@ -620,7 +620,7 @@ async function getReposActivity(config, env) {
             };
           }
         }
-      } catch (e) { /* ignore */ }
+      } catch (e) { console.error("getReposActivity commit:", e.message); }
       return result;
     })
   );
