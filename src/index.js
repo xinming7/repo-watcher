@@ -407,18 +407,37 @@ async function getHistory(limit, env) {
   return { history: (history || []).slice(0, limit) };
 }
 
+// Batch history writes: collect entries in memory, flush periodically
+let _historyBuffer = [];
+let _lastFlush = 0;
+const HISTORY_FLUSH_INTERVAL = 30000; // 30 seconds
+
 async function addHistoryEntry(entry, env) {
+  _historyBuffer.push({
+    ...entry,
+    timestamp: new Date().toISOString(),
+    priority: entry.priority || 'normal',
+  });
+  // Flush if buffer is large enough or enough time has passed
+  const now = Date.now();
+  if (_historyBuffer.length >= 10 || (now - _lastFlush > HISTORY_FLUSH_INTERVAL && _historyBuffer.length > 0)) {
+    await flushHistoryBuffer(env);
+  }
+}
+
+async function flushHistoryBuffer(env) {
+  if (_historyBuffer.length === 0) return;
   try {
     const history = (await env.WATCHER_STATE.get("history", { type: "json" })) || [];
-    history.unshift({
-      ...entry,
-      timestamp: new Date().toISOString(),
-      priority: entry.priority || 'normal',
-    });
+    const newEntries = _historyBuffer.splice(0); // Take all buffered entries
+    _lastFlush = Date.now();
+    for (const entry of newEntries) {
+      history.unshift(entry);
+    }
     // Keep only last 200 entries
     await env.WATCHER_STATE.put("history", JSON.stringify(history.slice(0, 200)));
   } catch (e) {
-    console.error("addHistoryEntry failed:", e.message);
+    console.error("flushHistoryBuffer failed:", e.message);
   }
 }
 
@@ -781,6 +800,9 @@ async function doCheckAllRepos(env) {
       }
     }
   }
+  // Flush any remaining history entries
+  await flushHistoryBuffer(env);
+
   return { checked: repos.length, notifications };
 }
 
@@ -808,6 +830,9 @@ async function checkRepo(repo, watch, config, env) {
 }
 
 async function checkReleases(repo, config, env, filters, watch) {
+  // per_page=5: balances API quota vs coverage. If a repo publishes >5 releases
+  // between cron checks (30 min), intermediate ones may be missed. This is an
+  // acceptable trade-off for free-tier GitHub API limits.
   const data = await githubAPI(`/repos/${repo}/releases?per_page=5`, config);
   if (!data || !Array.isArray(data) || data.length === 0) return 0;
 
@@ -1167,7 +1192,18 @@ async function checkRepoMeta(repo, watch, config, env) {
   if (!needStars && !needForks) return 0;
 
   try {
-    const repoData = await githubAPI(`/repos/${repo}`, config);
+    // Try to reuse data from compare_cache to avoid duplicate API calls
+    let repoData;
+    const cached = await env.WATCHER_STATE.get("compare_cache", { type: "json" });
+    if (cached && cached.data && cached.data.repos) {
+      const cachedRepo = cached.data.repos.find(r => r.repo === repo);
+      if (cachedRepo) {
+        repoData = { stargazers_count: cachedRepo.stars, forks_count: cachedRepo.forks };
+      }
+    }
+    if (!repoData) {
+      repoData = await githubAPI(`/repos/${repo}`, config);
+    }
     let sent = 0;
 
     // Star milestones
