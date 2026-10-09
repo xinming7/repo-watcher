@@ -323,7 +323,7 @@ async function getRepos(env, existingConfig) {
 }
 
 function normalizeWatch(w) {
-    if (!w) return { releases: false, commits: false, actions: false, issues: false, prs: false, forks: false, prReviews: false, trackPreRelease: false };
+    if (!w) return { releases: true, commits: true, actions: false, issues: false, prs: false, forks: false, prReviews: false, trackPreRelease: false };
   return {
     releases: w.releases !== undefined ? w.releases : true,
     commits: w.commits !== undefined ? w.commits : true,
@@ -857,7 +857,7 @@ async function checkReleases(repo, config, env, filters, watch) {
   const cutoff = Date.now() - 24 * 60 * 60 * 1000;
 
   let notified = 0;
-  for (const release of newReleases.reverse()) {
+  for (const release of [...newReleases].reverse()) {
     // Skip releases older than 24 hours (state was stale, not truly new)
     if (new Date(release.published_at).getTime() < cutoff) continue;
 
@@ -1440,7 +1440,7 @@ async function sendNotification(text, config, priority) {
       await fetch(config.notifyDiscord, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content: fullText.replace(/<[^>]*>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'") }),
+        body: JSON.stringify({ content: stripHTML(fullText) }),
       });
     } catch (e) { console.error('Discord notify failed:', e.message); }
   }
@@ -1450,7 +1450,7 @@ async function sendNotification(text, config, priority) {
       await fetch(config.notifySlack, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: fullText.replace(/<[^>]*>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'") }),
+        body: JSON.stringify({ text: stripHTML(fullText) }),
       });
     } catch (e) { console.error('Slack notify failed:', e.message); }
   }
